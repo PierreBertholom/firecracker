@@ -258,12 +258,13 @@ pub struct VirtioBlock {
     pub read_only: bool,
 
     pub metrics: Arc<BlockDeviceMetrics>,
-    pub state: BlockState,
+    pub(crate) state: BlockState,
 }
 
 /// State of data-path resources ownership
+// TRW: review scope — pub(crate) only so persist.rs can construct on restore.
 #[derive(Debug)]
-enum BlockState {
+pub(crate) enum BlockState {
     // MMIO sets configuration inplace before activation
     Configuring(BlockResources),
     // Transition state when moving resources to worker
@@ -273,21 +274,22 @@ enum BlockState {
 }
 
 /// Data-path resources owned by worker
+// TRW: review scope — pub(crate) only so persist.rs can construct on restore.
 #[derive(Debug)]
-struct BlockResources {
+pub(crate) struct BlockResources {
     // Transport related fields.
-    queues: Vec<Queue>,
-    queue_evts: [EventFd; 1],
+    pub(crate) queues: Vec<Queue>,
+    pub(crate) queue_evts: [EventFd; 1],
 
     // Host file and properties.
-    disk: DiskProperties,
-    rate_limiter: RateLimiter,
-    is_io_engine_throttled: bool,
+    pub(crate) disk: DiskProperties,
+    pub(crate) rate_limiter: RateLimiter,
+    pub(crate) is_io_engine_throttled: bool,
 }
 
 /// What config can access when device is active
 #[derive(Debug)]
-struct ActiveBlock {
+pub(crate) struct ActiveBlock {
     worker: BlockWorker, // TRW: change to handle later
     queue_cfg: Vec<QueueConfig>,
 }
@@ -589,11 +591,11 @@ impl VirtioBlock {
         match &self.state {
             BlockState::Configuring(res) => res,
             BlockState::Active(active) => &active.worker.resources, // TRW
-            BlockState::Activating => unreachable!("resources() called during activation"),
+            BlockState::Activating  => unreachable!("resources() called during activation"),
         }
     }
 
-    fn resources_mut(&mut self) -> &mut BlockResources {
+    pub(crate) fn resources_mut(&mut self) -> &mut BlockResources {
         match &mut self.state {
             BlockState::Configuring(res) => res,
             BlockState::Active(active) => &mut active.worker.resources, // TRW
@@ -601,9 +603,12 @@ impl VirtioBlock {
         }
     }
 
+    pub(crate) fn disk(&self) -> &DiskProperties { &self.resources().disk }
+    pub(crate) fn rate_limiter(&self) -> &RateLimiter { &self.resources().rate_limiter }
+
     /// Retrieve the file engine type.
-    fn file_engine_type(&self) -> FileEngineType {
-        match self.resources().disk.file_engine {
+    pub(crate) fn file_engine_type(&self) -> FileEngineType {
+        match self.disk().file_engine {
             FileEngine::Sync(_)  => FileEngineType::Sync,
             FileEngine::Async(_) => FileEngineType::Async,
         }
@@ -611,10 +616,10 @@ impl VirtioBlock {
 
     /// Returns a copy of a device config
     pub fn config(&self) -> VirtioBlockConfig {
-        let rl: RateLimiterConfig = (self.resources().rate_limiter).into();
+        let rl: RateLimiterConfig = self.rate_limiter().into();
         VirtioBlockConfig {
             drive_id: self.id.clone(),
-            path_on_host: self.resources().disk.file_path.clone(),
+            path_on_host: self.disk().file_path.clone(),
             is_root_device: self.root_device,
             partuuid: self.partuuid.clone(),
             is_read_only: self.read_only,
@@ -626,8 +631,9 @@ impl VirtioBlock {
 
     /// Update the backing file and the config space of the block device.
     pub fn update_disk_image(&mut self, disk_image_path: String) -> Result<(), VirtioBlockError> {
-        self.resources_mut().disk.update(disk_image_path, self.read_only)?; // TRW: use channel instead
-        self.config_space.capacity = self.resources().disk.nsectors.to_le(); // virtio_block_config_space();
+        let read_only = self.read_only;
+        self.resources_mut().disk.update(disk_image_path, read_only)?; // TRW: use channel instead
+        self.config_space.capacity = self.disk().nsectors.to_le(); // virtio_block_config_space();
 
         // Kick the driver to pick up the changes. (But only if the device is already activated).
         if self.is_activated() {
@@ -643,6 +649,31 @@ impl VirtioBlock {
     /// Updates the parameters for the rate limiter
     pub fn update_rate_limiter(&mut self, bytes: BucketUpdate, ops: BucketUpdate) {
         self.resources_mut().rate_limiter.update_buckets(bytes, ops); // TRW: use channel instead
+    }
+
+    pub(crate) fn process_virtio_queues(&mut self) -> Result<(), InvalidAvailIdx> {
+        if let BlockState::Active(ab) = &mut self.state {
+            ab.worker.process_virtio_queues()
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Test-only forwarder so test helpers can drive the worker's queue handler directly
+    /// (production drives it through the `MutEventSubscriber` dispatch instead).
+    #[cfg(test)]
+    pub(crate) fn process_queue_event(&mut self) {
+        if let BlockState::Active(ab) = &mut self.state {
+            ab.worker.process_queue_event()
+        }
+    }
+
+    /// Test-only forwarder for the worker's async-completion handler.
+    #[cfg(test)]
+    pub(crate) fn process_async_completion_event(&mut self) {
+        if let BlockState::Active(ab) = &mut self.state {
+            ab.worker.process_async_completion_event()
+        }
     }
 
     /// Single thread path prepare save redirecting work to BlockWorker
@@ -748,7 +779,8 @@ impl VirtioDevice for VirtioBlock {
         self.acked_features
     }
 
-    fn set_acked_features(&mut self, acked_features: u64) {
+    fn set_acked_features(&mut
+                          self, acked_features: u64) {
         self.acked_features = acked_features;
     }
 
@@ -798,10 +830,14 @@ impl VirtioDevice for VirtioBlock {
     ) -> Result<(), ActivateError> {
         assert!(!self.is_activated());
 
+        if !matches!(self.state, BlockState::Configuring(_)) {
+            return Ok(());
+        }
+
         let BlockState::Configuring(mut res) =
             std::mem::replace(&mut self.state, BlockState::Activating)
         else {
-            return Ok(());
+            unreachable!("state checked to be Configuring above");
         };
 
         for q in res.queues.iter_mut() {
@@ -1292,12 +1328,12 @@ mod tests {
                 // Check that the data wasn't written to the file
                 let mut buf = [0u8; 512];
                 block
-                    .disk
+                    .disk()
                     .file_engine
                     .file()
                     .seek(SeekFrom::Start(0))
                     .unwrap();
-                block.disk.file_engine.file().read_exact(&mut buf).unwrap();
+                block.disk().file_engine.file().read_exact(&mut buf).unwrap();
                 assert_eq!(buf, empty_data.as_slice());
             }
 
@@ -1432,12 +1468,12 @@ mod tests {
                 mem.write_slice(empty_data.as_slice(), data_addr).unwrap();
 
                 let size = block
-                    .disk
+                    .disk()
                     .file_engine
                     .file()
                     .seek(SeekFrom::End(0))
                     .unwrap();
-                block.disk.file_engine.file().set_len(size / 2).unwrap();
+                block.disk().file_engine.file().set_len(size / 2).unwrap();
                 mem.write_obj(10, GuestAddress(request_type_addr.0 + 8))
                     .unwrap();
 
@@ -1466,12 +1502,12 @@ mod tests {
                     .set(VIRTQ_DESC_F_NEXT | VIRTQ_DESC_F_WRITE);
 
                 let size = block
-                    .disk
+                    .disk()
                     .file_engine
                     .file()
                     .seek(SeekFrom::End(0))
                     .unwrap();
-                block.disk.file_engine.file().set_len(size / 2).unwrap();
+                block.disk().file_engine.file().set_len(size / 2).unwrap();
                 // Update sector number: stored at `request_type_addr.0 + 8`
                 mem.write_obj(5, GuestAddress(request_type_addr.0 + 8))
                     .unwrap();
@@ -1515,13 +1551,13 @@ mod tests {
                     .unwrap();
 
                 block
-                    .disk
+                    .disk()
                     .file_engine
                     .file()
                     .seek(SeekFrom::Start(512))
                     .unwrap();
                 block
-                    .disk
+                    .disk()
                     .file_engine
                     .file()
                     .write_all(&rand_data[512..])
@@ -1647,7 +1683,7 @@ mod tests {
             let request_type_addr = GuestAddress(vq.dtable[0].addr.get());
             let data_addr = GuestAddress(vq.dtable[1].addr.get());
             let status_addr = GuestAddress(vq.dtable[2].addr.get());
-            let blk_metadata = block.disk.file_engine.file().metadata();
+            let blk_metadata = block.disk().file_engine.file().metadata();
 
             // Test that the driver receives the correct device id.
             {
@@ -1765,31 +1801,31 @@ mod tests {
             let mem = default_mem();
             let interrupt = default_interrupt();
             let vq = VirtQueue::new(GuestAddress(0), &mem, IO_URING_NUM_ENTRIES * 4);
-            block.queues[0] = vq.create_queue();
+            block.resources_mut().queues[0] = vq.create_queue();
             block.activate(mem.clone(), interrupt).unwrap();
 
             // Run scenario that doesn't trigger FullSq BlockError: Add sq_size flush requests.
             add_flush_requests_batch(&mut block, &vq, IO_URING_NUM_ENTRIES);
             simulate_queue_event(&mut block, Some(false));
-            assert!(!block.is_io_engine_throttled);
+            assert!(!block.resources().is_io_engine_throttled);
             simulate_async_completion_event(&mut block, true);
             check_flush_requests_batch(IO_URING_NUM_ENTRIES, &vq);
 
             // Run scenario that triggers FullSqError : Add sq_size + 10 flush requests.
             add_flush_requests_batch(&mut block, &vq, IO_URING_NUM_ENTRIES + 10);
             simulate_queue_event(&mut block, Some(false));
-            assert!(block.is_io_engine_throttled);
+            assert!(block.resources().is_io_engine_throttled);
             // When the async_completion_event is triggered:
             // 1. sq_size requests should be processed processed.
             // 2. is_io_engine_throttled should be set back to false.
             // 3. process_queue() should be called again.
             simulate_async_completion_event(&mut block, true);
-            assert!(!block.is_io_engine_throttled);
+            assert!(!block.resources().is_io_engine_throttled);
             check_flush_requests_batch(IO_URING_NUM_ENTRIES, &vq);
             // check that process_queue() was called again resulting in the processing of the
             // remaining 10 ops.
             simulate_async_completion_event(&mut block, true);
-            assert!(!block.is_io_engine_throttled);
+            assert!(!block.resources().is_io_engine_throttled);
             check_flush_requests_batch(IO_URING_NUM_ENTRIES + 10, &vq);
         }
 
@@ -1800,25 +1836,25 @@ mod tests {
             let mem = default_mem();
             let interrupt = default_interrupt();
             let vq = VirtQueue::new(GuestAddress(0), &mem, IO_URING_NUM_ENTRIES * 4);
-            block.queues[0] = vq.create_queue();
+            block.resources_mut().queues[0] = vq.create_queue();
             block.activate(mem.clone(), interrupt).unwrap();
 
             // Run scenario that triggers FullCqError. Push 2 * IO_URING_NUM_ENTRIES and wait for
             // completion. Then try to push another entry.
             add_flush_requests_batch(&mut block, &vq, IO_URING_NUM_ENTRIES);
             simulate_queue_event(&mut block, Some(false));
-            assert!(!block.is_io_engine_throttled);
+            assert!(!block.resources().is_io_engine_throttled);
             thread::sleep(Duration::from_millis(150));
             add_flush_requests_batch(&mut block, &vq, IO_URING_NUM_ENTRIES);
             simulate_queue_event(&mut block, Some(false));
-            assert!(!block.is_io_engine_throttled);
+            assert!(!block.resources().is_io_engine_throttled);
             thread::sleep(Duration::from_millis(150));
 
             add_flush_requests_batch(&mut block, &vq, 1);
             simulate_queue_event(&mut block, Some(false));
-            assert!(block.is_io_engine_throttled);
+            assert!(block.resources().is_io_engine_throttled);
             simulate_async_completion_event(&mut block, true);
-            assert!(!block.is_io_engine_throttled);
+            assert!(!block.resources().is_io_engine_throttled);
             check_flush_requests_batch(IO_URING_NUM_ENTRIES * 2, &vq);
         }
     }
@@ -1831,7 +1867,7 @@ mod tests {
             let mem = default_mem();
             let interrupt = default_interrupt();
             let vq = VirtQueue::new(GuestAddress(0), &mem, 16);
-            block.queues[0] = vq.create_queue();
+            block.resources_mut().queues[0] = vq.create_queue();
             block.activate(mem.clone(), interrupt).unwrap();
 
             // Add a batch of flush requests.
@@ -1884,7 +1920,7 @@ mod tests {
                 );
 
                 // Assert that limiter is blocked.
-                assert!(block.rate_limiter.is_blocked());
+                assert!(block.rate_limiter().is_blocked());
                 // Make sure the data is still queued for processing.
                 assert_eq!(vq.used.idx.get(), 0);
             }
@@ -1898,10 +1934,10 @@ mod tests {
                 check_metric_after_block!(
                     &block.metrics.rate_limiter_throttled_events,
                     0,
-                    block.process_rate_limiter_event()
+                    if let BlockState::Active(ab) = &mut block.state { ab.worker.process_rate_limiter_event() }
                 );
                 // Validate the rate_limiter is no longer blocked.
-                assert!(!block.rate_limiter.is_blocked());
+                assert!(!block.rate_limiter().is_blocked());
                 // Complete async IO ops if needed
                 simulate_async_completion_event(&mut block, true);
 
@@ -1953,7 +1989,7 @@ mod tests {
                 );
 
                 // Assert that limiter is blocked.
-                assert!(block.rate_limiter.is_blocked());
+                assert!(block.rate_limiter().is_blocked());
                 // Make sure the data is still queued for processing.
                 assert_eq!(vq.used.idx.get(), 0);
             }
@@ -1968,7 +2004,7 @@ mod tests {
                 );
 
                 // Assert that limiter is blocked.
-                assert!(block.rate_limiter.is_blocked());
+                assert!(block.rate_limiter().is_blocked());
                 // Make sure the data is still queued for processing.
                 assert_eq!(vq.used.idx.get(), 0);
             }
@@ -1982,10 +2018,10 @@ mod tests {
                 check_metric_after_block!(
                     &block.metrics.rate_limiter_throttled_events,
                     0,
-                    block.process_rate_limiter_event()
+                    if let BlockState::Active(ab) = &mut block.state { ab.worker.process_rate_limiter_event() }
                 );
                 // Validate the rate_limiter is no longer blocked.
-                assert!(!block.rate_limiter.is_blocked());
+                assert!(!block.rate_limiter().is_blocked());
                 // Complete async IO ops if needed
                 simulate_async_completion_event(&mut block, true);
 
@@ -2022,10 +2058,10 @@ mod tests {
                 .unwrap();
 
             assert_eq!(
-                block.disk.file_engine.file().metadata().unwrap().st_ino(),
+                block.disk().file_engine.file().metadata().unwrap().st_ino(),
                 mdata.st_ino()
             );
-            assert_eq!(block.disk.image_id, id.as_slice());
+            assert_eq!(block.disk().image_id, id.as_slice());
         }
     }
 }
