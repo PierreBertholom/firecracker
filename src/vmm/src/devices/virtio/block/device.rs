@@ -149,21 +149,21 @@ impl VirtioDevice for Block {
 
     fn queues(&self) -> &[Queue] {
         match self {
-            Self::Virtio(b) => &b.queues,
+            Self::Virtio(b) => b.queues(),
             Self::VhostUser(b) => &b.queues,
         }
     }
 
     fn queues_mut(&mut self) -> &mut [Queue] {
         match self {
-            Self::Virtio(b) => &mut b.queues,
+            Self::Virtio(b) => &mut b.resources_mut().queues,
             Self::VhostUser(b) => &mut b.queues,
         }
     }
 
     fn queue_events(&self) -> &[EventFd] {
         match self {
-            Self::Virtio(b) => &b.queue_evts,
+            Self::Virtio(b) => b.queue_events(),
             Self::VhostUser(b) => &b.queue_evts,
         }
     }
@@ -202,7 +202,7 @@ impl VirtioDevice for Block {
 
     fn is_activated(&self) -> bool {
         match self {
-            Self::Virtio(b) => b.device_state.is_activated(),
+            Self::Virtio(b) => b.is_activated(),
             Self::VhostUser(b) => b.device_state.is_activated(),
         }
     }
