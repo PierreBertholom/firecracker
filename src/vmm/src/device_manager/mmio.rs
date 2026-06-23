@@ -24,6 +24,7 @@ use crate::arch::{RTC_MEM_START, SERIAL_MEM_START};
 #[cfg(target_arch = "aarch64")]
 use crate::devices::legacy::{RTCDevice, SerialDevice};
 use crate::devices::pseudo::BootTimer;
+use crate::device_manager::worker_pool::WorkerPool;
 use crate::devices::virtio::device::{VirtioDevice, VirtioDeviceId, VirtioDeviceType};
 use crate::devices::virtio::transport::mmio::MmioTransport;
 #[cfg(target_arch = "x86_64")]
@@ -175,12 +176,17 @@ impl MMIODeviceManager {
     }
 
     /// Register a virtio-over-MMIO device to be used via MMIO transport at a specific slot.
+    ///
+    /// When `worker_pool` is `Some`, the device is assigned to a worker thread (its event
+    /// processing runs off the shared VMM thread); otherwise it is added to the shared
+    /// `event_manager` as before.
     pub fn register_mmio_virtio(
         &mut self,
         vm: &KvmVm,
         device_id: String,
         mut device: MMIODevice<MmioTransport>,
         event_manager: &mut EventManager,
+        worker_pool: Option<&WorkerPool>,
     ) -> Result<(), MmioError> {
         // Our virtio devices are currently hardcoded to use a single IRQ.
         // Validate that requirement.
@@ -208,9 +214,18 @@ impl MMIODeviceManager {
             device.resources.len,
         )?;
 
-        let sub_id =
-            event_manager.add_subscriber(device.inner.lock().expect("Poisoned lock").device());
-        device.sub_id = Some(sub_id);
+        let virtio_device = device.inner.lock().expect("Poisoned lock").device();
+        match worker_pool {
+            // Pool active: hand the device to a worker thread. The device's event sources are
+            // registered on the worker's own EventManager (fire-and-forget). It is therefore
+            // not tracked by the shared `event_manager`, so there is no `sub_id`.
+            Some(pool) => pool.assign(virtio_device),
+            // Legacy: device runs on the shared VMM EventManager, exactly as before.
+            None => {
+                let sub_id = event_manager.add_subscriber(virtio_device);
+                device.sub_id = Some(sub_id);
+            }
+        }
 
         self.virtio_devices.insert(identifier, device);
 
@@ -247,6 +262,7 @@ impl MMIODeviceManager {
         mmio_device: MmioTransport,
         event_manager: &mut EventManager,
         _cmdline: &mut kernel_cmdline::Cmdline,
+        worker_pool: Option<&WorkerPool>,
     ) -> Result<(), MmioError> {
         let device = MMIODevice {
             resources: self.allocate_mmio_resources(&mut vm.resource_allocator(), 1)?,
@@ -266,7 +282,7 @@ impl MMIODeviceManager {
                 device.resources.gsi.unwrap(),
             )?;
         }
-        self.register_mmio_virtio(vm, device_id, device, event_manager)?;
+        self.register_mmio_virtio(vm, device_id, device, event_manager, worker_pool)?;
         Ok(())
     }
 
@@ -485,6 +501,7 @@ pub(crate) mod tests {
                 mmio_device,
                 event_manager,
                 cmdline,
+                None,
             )?;
             Ok(self
                 .get_virtio_device(device.lock().unwrap().device_type(), dev_id)

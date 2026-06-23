@@ -18,6 +18,7 @@ use linux_loader::loader::Cmdline;
 use mmio::{MMIODeviceManager, MmioError};
 use pci_mngr::{PciDevices, PciDevicesConstructorArgs, PciManagerError};
 use persist::MMIODevManagerConstructorArgs;
+use worker_pool::WorkerPool;
 use serde::{Deserialize, Serialize};
 use utils::time::TimestampUs;
 use vm_superio::serial;
@@ -48,6 +49,7 @@ use crate::devices::virtio::transport::pci::device::CAPABILITY_BAR_SIZE;
 use crate::devices::virtio::vsock::{VsockError, VsockUnixBackendError};
 use crate::logger::{error, info, warn};
 use crate::rate_limiter::TokenBucket;
+use crate::seccomp::BpfProgram;
 use crate::resources::VmResources;
 use crate::rpc_interface::VmmActionError;
 use crate::snapshot::Persist;
@@ -71,6 +73,8 @@ pub mod mmio;
 pub mod pci_mngr;
 /// Device managers (de)serialization support.
 pub mod persist;
+/// Device-emulation worker thread pool (prototype).
+pub mod worker_pool;
 
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
 /// Error while creating a new [`DeviceManager`]
@@ -124,6 +128,9 @@ pub struct DeviceManager {
     pub acpi_devices: ACPIDeviceManager,
     /// PCIe devices
     pub pci_devices: PciDevices,
+    /// Device-emulation worker thread pool. `None` when `pool_size == 0` (legacy: devices run
+    /// on the shared VMM `EventManager`). Prototype — see `worker_pool`.
+    pub device_worker_pool: Option<WorkerPool>,
 }
 
 impl DeviceManager {
@@ -233,6 +240,8 @@ impl DeviceManager {
         vm: &KvmVm,
         serial_output: Option<&PathBuf>,
         serial_rate_limiter: Option<TokenBucket>,
+        pool_size: usize,
+        worker_seccomp_filter: Arc<BpfProgram>,
     ) -> Result<Self, DeviceManagerCreateError> {
         #[cfg(target_arch = "x86_64")]
         let legacy_devices = Self::create_legacy_devices(
@@ -244,13 +253,28 @@ impl DeviceManager {
             serial_rate_limiter,
         )?;
 
+        // `pool_size == 0` keeps the legacy behavior: devices run on the shared VMM
+        // `EventManager`, no worker threads are spawned.
+        let device_worker_pool =
+            (pool_size > 0).then(|| WorkerPool::new(pool_size, worker_seccomp_filter));
+
         Ok(DeviceManager {
             mmio_devices: MMIODeviceManager::new(),
             #[cfg(target_arch = "x86_64")]
             legacy_devices: Some(legacy_devices),
             acpi_devices: ACPIDeviceManager::default(),
             pci_devices: PciDevices::new(),
+            device_worker_pool,
         })
+    }
+
+    /// Stop and join all device worker threads, if a pool is active. Must be called while
+    /// guest memory and the MMIO bus are still alive (i.e. before VMM teardown), so a worker
+    /// can never touch freed state. Idempotent.
+    pub fn shutdown_device_workers(&mut self) {
+        if let Some(pool) = self.device_worker_pool.as_mut() {
+            pool.shutdown();
+        }
     }
 
     /// Attaches an MMIO VirtioDevice device to the device manager and event manager.
@@ -269,8 +293,10 @@ impl DeviceManager {
         // The device mutex mustn't be locked here otherwise it will deadlock.
         let device =
             MmioTransport::new(vm.guest_memory().clone(), interrupt, device, is_vhost_user);
+        // Borrow the pool before borrowing `mmio_devices` mutably (disjoint fields).
+        let worker_pool = self.device_worker_pool.as_ref();
         self.mmio_devices
-            .register_mmio_virtio_for_boot(vm, id, device, event_manager, cmdline)?;
+            .register_mmio_virtio_for_boot(vm, id, device, event_manager, cmdline, worker_pool)?;
 
         Ok(())
     }
@@ -775,6 +801,9 @@ impl<'a> Persist<'a> for DeviceManager {
             legacy_devices: Some(legacy_devices),
             acpi_devices,
             pci_devices,
+            // Snapshot/restore with the worker pool is out of scope for the prototype:
+            // restored devices run on the shared VMM EventManager.
+            device_worker_pool: None,
         })
     }
 }
@@ -822,6 +851,7 @@ pub(crate) mod tests {
             legacy_devices: Some(legacy_devices),
             acpi_devices,
             pci_devices,
+            device_worker_pool: None,
         }
     }
 

@@ -616,6 +616,25 @@ class Microvm:
             return True
         return False
 
+    def pin_device_workers(self, first_cpu):
+        """Pin each device-emulation worker thread (thread-pool prototype) to its
+        own consecutive cpu core, starting at "first_cpu".
+
+        Returns the next "free" cpu core. A no-op (returns first_cpu unchanged)
+        when no worker pool is active, so the legacy path is unaffected.
+        """
+        worker_pids = []
+        for thread_name, pids in utils.get_threads(self.firecracker_pid).items():
+            # Thread name set via thread::Builder; Linux truncates comm to 15 chars.
+            if thread_name.startswith("fc_dev_worker"):
+                worker_pids.extend((thread_name, pid) for pid in pids)
+        # Pin in a stable order so runs are reproducible.
+        worker_pids.sort()
+        for offset, (thread_name, pid) in enumerate(worker_pids):
+            pcpu = first_cpu + offset
+            utils.set_cpu_affinity(pid, [pcpu])
+        return first_cpu + len(worker_pids)
+
     def pin_threads(self, first_cpu):
         """
         Pins all microvm threads (VMM, API and vCPUs) to consecutive physical cpu core, starting with "first_cpu"
@@ -636,7 +655,9 @@ class Microvm:
             first_cpu + self.vcpus_count + 1
         ), "Failed to pin fc_api thread."
 
-        return first_cpu + self.vcpus_count + 2
+        # Device-emulation worker threads (thread-pool prototype), if any, get
+        # their own cores after the API thread.
+        return self.pin_device_workers(first_cpu + self.vcpus_count + 2)
 
     def add_pre_cmd(self, pre_cmd):
         """Prepends commands to the command line to launch the microVM
@@ -820,6 +841,7 @@ class Microvm:
         rootfs_io_engine=None,
         cpu_template: Optional[str] = None,
         enable_entropy_device=False,
+        pool_size: int = None,
     ):
         """Shortcut for quickly configuring a microVM.
 
@@ -837,13 +859,18 @@ class Microvm:
         which differs from Firecracker's default only in the enabling of the serial console.
         Reference: file:../../src/vmm/src/vmm_config/boot_source.rs::DEFAULT_KERNEL_CMDLINE
         """
-        self.api.machine_config.put(
-            vcpu_count=vcpu_count,
-            smt=smt,
-            mem_size_mib=mem_size_mib,
-            track_dirty_pages=track_dirty_pages,
-            huge_pages=huge_pages,
-        )
+        machine_config_args = {
+            "vcpu_count": vcpu_count,
+            "smt": smt,
+            "mem_size_mib": mem_size_mib,
+            "track_dirty_pages": track_dirty_pages,
+            "huge_pages": huge_pages,
+        }
+        # Only send pool_size when explicitly requested, so the default path
+        # (device emulation on the shared VMM thread) is unchanged.
+        if pool_size is not None:
+            machine_config_args["pool_size"] = pool_size
+        self.api.machine_config.put(**machine_config_args)
         self.vcpus_count = vcpu_count
         self.mem_size_bytes = mem_size_mib * 2**20
 

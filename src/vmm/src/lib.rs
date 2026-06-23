@@ -691,6 +691,11 @@ impl Vmm {
     pub fn stop(&mut self, exit_code: FcExitCode) {
         info!("Vmm is stopping.");
 
+        // Stop and join device worker threads (if any) while guest memory and the MMIO bus are
+        // still alive. This runs on the main VMM thread before the event loop breaks (and thus
+        // before `Vmm` is dropped), so no worker can touch freed state mid-batch.
+        self.device_manager.shutdown_device_workers();
+
         // Break the main event loop, propagating the Vmm exit-code.
         self.shutdown_exit_code = Some(exit_code);
     }

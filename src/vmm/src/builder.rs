@@ -201,12 +201,20 @@ pub fn build_microvm_for_boot(
     let kvm_vm = Arc::new(vm);
     let vm = Vm::Kvm(kvm_vm.clone());
 
+    // Worker threads (if any) reuse the same "vmm" seccomp filter as the VMM thread: block I/O
+    // already runs under it today, so this is fair for the perf comparison and not a regression.
+    let worker_seccomp_filter = seccomp_filters
+        .get("vmm")
+        .ok_or_else(|| StartMicrovmError::MissingSeccompFilters("vmm".to_string()))?
+        .clone();
     let mut device_manager = DeviceManager::new(
         event_manager,
         kvm_vm.vcpus_exit_evt(),
         &kvm_vm,
         vm_resources.serial_out_path.as_ref(),
         vm_resources.serial_rate_limiter(),
+        vm_resources.machine_config.pool_size,
+        worker_seccomp_filter,
     )?;
 
     let guest_memory = kvm_vm.guest_memory();

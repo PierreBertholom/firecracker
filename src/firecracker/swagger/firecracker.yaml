@@ -1444,6 +1444,13 @@ definitions:
           - None
           - 2M
         description: Which huge pages configuration (if any) should be used to back guest memory.
+      pool_size:
+        type: integer
+        minimum: 0
+        description:
+          Number of device-emulation worker threads to pre-spawn (experimental thread-pool
+          prototype). 0 (the default) keeps device emulation on the shared VMM thread.
+        default: 0
 
   MemoryBackend:
     type: object

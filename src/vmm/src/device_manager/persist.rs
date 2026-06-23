@@ -405,12 +405,15 @@ impl<'a> Persist<'a> for MMIODeviceManager {
             dev_manager.register_mmio_virtio(
                 vm,
                 id.clone(),
+                // Restore keeps devices on the shared EventManager (no worker pool for the
+                // prototype's snapshot/restore path).
                 MMIODevice {
                     resources: *device_info,
                     inner: mmio_transport,
                     sub_id: None,
                 },
                 event_manager,
+                None,
             )?;
 
             if activated {
