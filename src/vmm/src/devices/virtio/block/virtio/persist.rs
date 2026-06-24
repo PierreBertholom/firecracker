@@ -3,6 +3,7 @@
 
 //! Defines the structures needed for saving/restoring block devices.
 
+use std::sync::Arc;
 use device::ConfigSpace;
 use serde::{Deserialize, Serialize};
 use vmm_sys_util::eventfd::EventFd;
@@ -134,8 +135,10 @@ impl Persist<'_> for VirtioBlock {
             root_device: state.root_device,
             read_only: is_read_only,
 
+            threaded: false,
             state: BlockState::Configuring(blk_resources),
             metrics: BlockMetricsPerDevice::alloc(state.id.clone()),
+            seccomp_filter: Arc::new(vec![]),
         })
     }
 }
