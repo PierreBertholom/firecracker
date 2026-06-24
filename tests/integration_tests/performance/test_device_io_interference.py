@@ -36,6 +36,12 @@ FIO_BLOCK_SIZE = 4096
 # Base port for iperf3 servers.
 IPERF_BASE_PORT = 5000
 
+# Largest pool_size exercised by the sweep. Used to reserve a fixed block of
+# cores for worker threads so that load-generator pinning (iperf) stays at the
+# same host cores across all pool_size arms -- otherwise the comparison would
+# confound "where block I/O runs" with "where the iperf servers run".
+MAX_POOL_SIZE = 2
+
 def prepare_for_io(microvm, guest_devices=("vdb",)):
     """Flush and drop caches so block measurements hit the device, not caches"""
     for dev in guest_devices:
@@ -211,7 +217,16 @@ def test_block_net_throughput_interference(
         }
     )
 
-    first_free_cpu = vm.pin_threads(0)
+    vm.pin_threads(0)
+
+    # Pin iperf servers to a FIXED base across all pool_size arms, so the only
+    # variable between arms is where block I/O runs (shared VMM thread vs worker
+    # threads) -- NOT where the iperf servers land. `pin_threads` returns a base
+    # that grows with the worker count (0 workers -> 4, 2 workers -> 6), which
+    # would silently relocate the iperf servers between arms and confound the
+    # net comparison. Reserve room for the worst case: vcpus + VMM + API +
+    # MAX_POOL_SIZE worker cores.
+    iperf_base_cpu = vcpus + 2 + MAX_POOL_SIZE
 
     if scenario == "block_only":
         cpu_util = run_fio_blocking(
@@ -236,7 +251,7 @@ def test_block_net_throughput_interference(
     )
 
     if scenario == "net_only":
-        data = iperf_test.run_test(first_free_cpu)
+        data = iperf_test.run_test(iperf_base_cpu)
         emit_iperf3_metrics(metrics, data, WARMUP_SEC)
         return
 
@@ -254,7 +269,7 @@ def test_block_net_throughput_interference(
             RUNTIME_SEC,
             WARMUP_SEC,
         )
-        data = iperf_test.run_test(first_free_cpu)
+        data = iperf_test.run_test(iperf_base_cpu)
         # Make sure the block workload finished cleanly.
         assert fio_future.result() == 0
 
