@@ -27,7 +27,7 @@ use crate::devices::virtio::ActivateError;
 use crate::devices::virtio::block::CacheType;
 use crate::devices::virtio::block::device::Block;
 use crate::devices::virtio::block::virtio::metrics::{BlockDeviceMetrics, BlockMetricsPerDevice};
-use crate::devices::virtio::block::virtio::worker::{BlockWorker, WorkerHandle};
+use crate::devices::virtio::block::virtio::worker::{BlockWorker, ThreadedWorker, WorkerHandle};
 use crate::devices::virtio::device::{ActiveState, DeviceState, VirtioDevice, VirtioDeviceType};
 use crate::devices::virtio::generated::virtio_blk::{
     VIRTIO_BLK_F_FLUSH, VIRTIO_BLK_F_RO, VIRTIO_BLK_ID_BYTES,
@@ -311,7 +311,7 @@ pub(crate) struct InlineActive {
 #[derive(Debug)]
 pub(crate) struct ThreadedActive {
     worker_handle: WorkerHandle,
-    worker_arc: Arc<Mutex<BlockWorker>>,
+    worker_arc: Arc<Mutex<ThreadedWorker>>,
     queue_cfg: Vec<QueueConfig>,
 }
 
@@ -532,7 +532,14 @@ impl VirtioBlock {
         if let Err(err) = self.activate_evt.read() {
             error!("Failed to consume block activate event: {:?}", err);
         }
-        self.register_runtime_events(ops);
+
+        // threaded: registers events at init()
+        // when the spawned thread subscribes to its event manager
+        if !self.threaded {
+            self.register_runtime_events(ops);
+        }
+
+        // TRW: threaded virtio block becomes zombie subs
         if let Err(err) = ops.remove(Events::with_data(
             &self.activate_evt,
             Self::PROCESS_ACTIVATE,
@@ -671,7 +678,15 @@ impl VirtioDevice for VirtioBlock {
             metrics: self.metrics.clone(),
         };
 
-        self.state = BlockState::Active(ActiveBlock::Inline(InlineActive {worker, queue_cfg}));
+        if self.threaded {
+            let (worker_handle, worker_arc) =
+                WorkerHandle::spawn(worker, self.seccomp_filter.clone())
+                    .map_err(ActivateError::ThreadSpawn)?;
+            self.state =
+                BlockState::Active(ActiveBlock::Threaded(ThreadedActive { worker_handle, worker_arc, queue_cfg }));
+        } else {
+            self.state = BlockState::Active(ActiveBlock::Inline(InlineActive { worker, queue_cfg }));
+        }
 
         if self.activate_evt.write(1).is_err() {
             self.metrics.activate_fails.inc();

@@ -5,15 +5,17 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the THIRD-PARTY file.
 
-use std::sync::Arc;
-use std::sync::mpsc::{Receiver, Sender};
-use std::thread::{JoinHandle, Thread};
-use event_manager::{EventOps, Events, MutEventSubscriber};
+use std::sync::{Arc, Mutex};
+use std::sync::mpsc::{Receiver, Sender, channel};
+use std::thread::{self, JoinHandle};
+use event_manager::{EventOps, Events, MutEventSubscriber, SubscriberOps};
+use crate::EventManager;
 use crate::devices::virtio::block::virtio::device::BlockResources;
 use crate::devices::virtio::block::virtio::metrics::BlockDeviceMetrics;
 use crate::devices::virtio::block::virtio::{FinishedRequest, IoErr, ProcessingResult, Request, VirtioBlockError};
 use crate::devices::virtio::device::ActiveState;
 use crate::rate_limiter::BucketUpdate;
+use crate::seccomp::{BpfProgram, apply_filter};
 use vmm_sys_util::epoll::EventSet;
 use vmm_sys_util::eventfd::EventFd;
 use crate::devices::virtio::block::virtio::io::{async_io, FileEngine};
@@ -29,12 +31,9 @@ pub(crate) struct BlockWorker {
     pub(crate) metrics: Arc<BlockDeviceMetrics>,
 }
 
-/// Wrapper for threaded mode
+#[derive(Debug)]
 pub(crate) struct ThreadedWorker {
     worker: BlockWorker,
-    worker_state: WorkerState,
-    control_rx: Receiver<ControlMsg>,
-    response_tx: Sender<ControlResponse>,
     control_evt: EventFd,
 }
 
@@ -62,6 +61,51 @@ pub(crate) struct WorkerHandle {
     receiver_rx: Receiver<ControlResponse>,
     control_evt: EventFd,
     join: JoinHandle<()>,
+}
+
+impl WorkerHandle {
+    pub(crate) fn spawn(
+        worker: BlockWorker,
+        seccomp_filter: Arc<BpfProgram>,
+    ) -> Result<(WorkerHandle, Arc<Mutex<ThreadedWorker>>), std::io::Error> {
+        // One kick eventfd, shared between worker (registers on its epoll) and shell (writes to
+        // wake it). Both refer to the same kernel object via try_clone.
+        let control_evt = EventFd::new(libc::EFD_NONBLOCK)?;
+        let handle_evt = control_evt.try_clone()?;
+
+        let (control_tx, control_rx) = channel::<ControlMsg>();
+        let (response_tx, receiver_rx) = channel::<ControlResponse>();
+
+        let worker_arc = Arc::new(Mutex::new(ThreadedWorker { worker, control_evt }));
+        let loop_arc = Arc::clone(&worker_arc);
+
+        let join = thread::Builder::new()
+            .name("fc_blk_worker".to_owned())
+            .spawn(move || {
+                // epoll first (forbidden by seccomp), then register, then lock down.
+                let mut event_manager = EventManager::new()
+                    .expect("Failed to create block worker EventManager");
+
+                let subscriber: Arc<Mutex<dyn MutEventSubscriber>> = loop_arc.clone();
+                event_manager.add_subscriber(subscriber);
+
+                if let Err(err) = apply_filter(&seccomp_filter) {
+                    panic!("Failed to apply seccomp filter on block worker: {err}");
+                }
+
+                run_worker_loop(loop_arc, event_manager, control_rx, response_tx);
+            })?;
+
+        Ok((
+            WorkerHandle {
+                control_tx,
+                receiver_rx,
+                control_evt: handle_evt,
+                join,
+            },
+            worker_arc,
+        ))
+    }
 }
 
 
@@ -339,42 +383,64 @@ impl ThreadedWorker {
             error!("Failed to get control event: {:?}", err);
             self.worker.metrics.event_fails.inc();
         }
+    }
+}
 
-        while let Ok(msg) = self.control_rx.try_recv() {
-            match msg {
-                ControlMsg::UpdateDiskImage(path) => todo!("step 4: control plane"),
-                ControlMsg::UpdateRateLimiter(bytes, ops_update) => {
-                    self.worker.update_rate_limiter(bytes, ops_update);
+fn run_worker_loop(worker_arc: Arc<Mutex<ThreadedWorker>>, mut event_manager: EventManager, control_rx: Receiver<ControlMsg>, response_tx: Sender<ControlResponse>) {
+    let mut state = WorkerState::Running;
+
+    loop {
+        match state {
+            WorkerState::Running => {
+                if let Err(err) = event_manager.run() {
+                    error!("Block worker event loop error: {:?}", err);
                 }
-                ControlMsg::Pause => {
-                    self.worker.prepare_save();
-                    if let Err(err) = self.response_tx.send(ControlResponse::Paused) {
-                        error!("Failed to send Paused ACK: {:?}", err);
+                while let Ok(msg) = control_rx.try_recv() {
+                    state = process_control_msg(&worker_arc, &response_tx, msg);
+                    if !matches!(state, WorkerState::Running) {
+                        break;
                     }
-                    self.worker_state = WorkerState::Paused;
-                }
-                ControlMsg::Resume => {
-                    self.worker_state = WorkerState::Running;
-                }
-                ControlMsg::Finish => {
-                    todo!();
                 }
             }
+            // block on recv waiting for Resume/Finish message
+            WorkerState::Paused => match control_rx.recv() {
+                Ok(msg) => state = process_control_msg(&worker_arc, &response_tx, msg),
+                Err(_) => state = WorkerState::Finished,
+            },
+            WorkerState::Finished => break,
         }
     }
 }
 
-/*
-    UpdateDiskImage(String),
-    UpdateRateLimiter(BucketUpdate, BucketUpdate),
-    Pause,
-    Resume,
-    Finish,
-*/
+fn process_control_msg(worker_arc: &Arc<Mutex<ThreadedWorker>>, response_tx: &Sender<ControlResponse>, msg: ControlMsg) -> WorkerState {
+    match msg {
+        ControlMsg::UpdateDiskImage(_path) => todo!("step 4: control plane"),
+        ControlMsg::UpdateRateLimiter(bytes, ops_update) => {
+            worker_arc
+                .lock()
+                .expect("Poisoned block worker lock")
+                .worker
+                .update_rate_limiter(bytes, ops_update);
+            WorkerState::Running
+        }
+        ControlMsg::Pause => {
+            worker_arc
+                .lock()
+                .expect("Poisoned block worker lock")
+                .worker
+                .prepare_save();
+            if let Err(err) = response_tx.send(ControlResponse::Paused) {
+                error!("Failed to send Paused ACK: {:?}", err);
+            }
+            WorkerState::Paused
+        }
+        ControlMsg::Resume => WorkerState::Running,
+        ControlMsg::Finish => WorkerState::Finished,
+    }
+}
 
 impl MutEventSubscriber for ThreadedWorker {
-
-    fn process(&mut self, event: Events, ops: &mut EventOps) {
+    fn process(&mut self, event: Events, _ops: &mut EventOps) {
         let source = event.data();
         let event_set = event.event_set();
 
@@ -396,7 +462,6 @@ impl MutEventSubscriber for ThreadedWorker {
             Self::PROCESS_CONTROL => self.process_control_event(),
             _ => warn!("Block: Spurious event received: {:?}", source),
         }
-
     }
 
     fn init(&mut self, ops: &mut EventOps) {
