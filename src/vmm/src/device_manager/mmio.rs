@@ -215,12 +215,18 @@ impl MMIODeviceManager {
         )?;
 
         let virtio_device = device.inner.lock().expect("Poisoned lock").device();
-        match worker_pool {
-            // Pool active: hand the device to a worker thread. The device's event sources are
-            // registered on the worker's own EventManager (fire-and-forget). It is therefore
-            // not tracked by the shared `event_manager`, so there is no `sub_id`.
+        // The prototype only pools BLOCK devices. Net/vsock/etc. stay on the shared VMM thread
+        // so the interference benchmark measures exactly one variable: moving *block* I/O off
+        // the VMM thread. (Net on a worker -- especially co-located with block -- is untested
+        // and not part of the prototype's scope.)
+        let pool_this_device =
+            matches!(identifier.0, VirtioDeviceType::Block).then_some(()).and(worker_pool);
+        match pool_this_device {
+            // Pool active and device is poolable: hand it to a worker thread. Its event sources
+            // are registered on the worker's own EventManager (fire-and-forget), so it is not
+            // tracked by the shared `event_manager` and has no `sub_id`.
             Some(pool) => pool.assign(virtio_device),
-            // Legacy: device runs on the shared VMM EventManager, exactly as before.
+            // Legacy (or non-poolable device): runs on the shared VMM EventManager, as before.
             None => {
                 let sub_id = event_manager.add_subscriber(virtio_device);
                 device.sub_id = Some(sub_id);
