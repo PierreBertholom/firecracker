@@ -106,6 +106,7 @@ def launch_vm_with_boot_timer(
     mem_size_mib,
     pci_enabled,
     boot_from_pmem,
+    pool_size=None,
 ):
     """Launches a microVM with guest-timer and returns the reported metrics for it"""
     vm = microvm_factory.build(
@@ -119,6 +120,7 @@ def launch_vm_with_boot_timer(
             mem_size_mib=mem_size_mib,
             boot_args=DEFAULT_BOOT_ARGS + " init=/usr/local/bin/init",
             enable_entropy_device=True,
+            pool_size=pool_size,
         )
     else:
         vm.basic_config(
@@ -127,6 +129,7 @@ def launch_vm_with_boot_timer(
             mem_size_mib=mem_size_mib,
             boot_args=DEFAULT_BOOT_ARGS + " init=/usr/local/bin/init rootflags=dax",
             enable_entropy_device=True,
+            pool_size=pool_size,
         )
         vm.add_pmem("pmem", rootfs, True, True)
 
@@ -152,6 +155,7 @@ def test_boot_timer(microvm_factory, guest_kernel, rootfs, pci_enabled):
 )
 @pin_rootfs_mode("rw")
 @pytest.mark.parametrize("boot_from_pmem", [True, False], ids=["PmemBoot", "BlockBoot"])
+@pytest.mark.parametrize("pool_size", [0, 2], ids=["pool0", "pool2"])
 @pytest.mark.nonci
 def test_boottime(
     microvm_factory,
@@ -160,10 +164,16 @@ def test_boottime(
     vcpu_count,
     mem_size_mib,
     boot_from_pmem,
+    pool_size,
     pci_enabled,
     metrics,
 ):
-    """Test boot time with different guest configurations"""
+    """Test boot time with different guest configurations.
+
+    Swept across ``pool_size`` (0 = legacy shared VMM thread, 2 = block devices
+    on worker threads) to measure the boot-path cost of pre-spawning the pool
+    and handing devices to worker threads.
+    """
 
     for i in range(10):
         vm, boot_time_us, cpu_boot_time_us = launch_vm_with_boot_timer(
@@ -174,6 +184,7 @@ def test_boottime(
             mem_size_mib,
             pci_enabled,
             boot_from_pmem,
+            pool_size=pool_size,
         )
 
         if i == 0:
@@ -181,6 +192,7 @@ def test_boottime(
                 {
                     "performance_test": "test_boottime",
                     "boot_from_pmem": str(boot_from_pmem),
+                    "pool_size": str(pool_size),
                     **vm.dimensions,
                 }
             )
