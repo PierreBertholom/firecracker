@@ -3,11 +3,13 @@
 """Tests that ensure the boot time to init process is within spec."""
 
 import datetime
+import os
 import re
 import time
 
 import pytest
 
+import host_tools.drive as drive_tools
 from framework.artifacts import ACPI_GUEST_KERNELS, pin_guest_kernel, pin_rootfs_mode
 
 # Regex for obtaining boot time from some string.
@@ -107,6 +109,7 @@ def launch_vm_with_boot_timer(
     pci_enabled,
     boot_from_pmem,
     pool_size=None,
+    num_scratch_drives=0,
 ):
     """Launches a microVM with guest-timer and returns the reported metrics for it"""
     vm = microvm_factory.build(
@@ -132,6 +135,15 @@ def launch_vm_with_boot_timer(
             pool_size=pool_size,
         )
         vm.add_pmem("pmem", rootfs, True, True)
+
+    # Attach extra scratch block devices to stress the boot-time cost of
+    # registering many devices (and, with a pool, handing each to a worker).
+    # They are only probed at boot, never written, so a tiny size is enough.
+    for idx in range(num_scratch_drives):
+        fs = drive_tools.FilesystemFile(
+            os.path.join(vm.fsfiles, f"scratch_{idx}"), size=8
+        )
+        vm.add_drive(f"scratch_{idx}", fs.path, io_engine="Sync")
 
     vm.add_net_iface()
     vm.start()
@@ -219,4 +231,72 @@ def test_boottime(
         metrics.put_metric("systemd_userspace", userspace, unit="Milliseconds")
         metrics.put_metric("systemd_total", total, unit="Milliseconds")
 
+        vm.kill()
+
+
+def emit_boottime_metrics(vm, metrics, boot_time_us, cpu_boot_time_us):
+    """Emit the standard boot-time metrics for a single launched microVM."""
+    metrics.put_metric("guest_boot_time", boot_time_us, unit="Microseconds")
+    metrics.put_metric("guest_cpu_boot_time", cpu_boot_time_us, unit="Microseconds")
+
+    events = find_events(vm.log_data)
+    build_time = events["build microvm for boot"]["duration"]
+    metrics.put_metric("build_time", build_time.microseconds, unit="Microseconds")
+    resume_time = events["boot microvm"]["duration"]
+    metrics.put_metric("resume_time", resume_time.microseconds, unit="Microseconds")
+
+    kernel, userspace, total = get_systemd_analyze_times(vm)
+    metrics.put_metric("systemd_kernel", kernel, unit="Milliseconds")
+    metrics.put_metric("systemd_userspace", userspace, unit="Milliseconds")
+    metrics.put_metric("systemd_total", total, unit="Milliseconds")
+
+
+# Number of extra scratch block devices attached for the many-device boot test.
+NUM_BLOCK_DEVICES = 10
+
+
+@pin_rootfs_mode("rw")
+@pytest.mark.parametrize("pool_size", [0, NUM_BLOCK_DEVICES], ids=["pool0", "pool10"])
+@pytest.mark.nonci
+def test_boottime_many_block_devices(
+    microvm_factory,
+    guest_kernel,
+    rootfs,
+    pool_size,
+    pci_enabled,
+    metrics,
+):
+    """Boot time with many block devices, legacy vs one worker thread per device.
+
+    Attaches ``NUM_BLOCK_DEVICES`` scratch block devices (plus the rootfs) and
+    measures boot time with ``pool_size`` 0 (all devices on the shared VMM
+    thread) vs ``NUM_BLOCK_DEVICES`` (each block device pre-spawned onto its own
+    worker thread). Isolates the boot-path cost of the pool as device count
+    grows -- worker pre-spawn and the per-device handoff both happen in the
+    "build microvm for boot" window.
+    """
+    for i in range(10):
+        vm, boot_time_us, cpu_boot_time_us = launch_vm_with_boot_timer(
+            microvm_factory,
+            guest_kernel,
+            rootfs,
+            vcpu_count=2,
+            mem_size_mib=1024,
+            pci_enabled=pci_enabled,
+            boot_from_pmem=False,
+            pool_size=pool_size,
+            num_scratch_drives=NUM_BLOCK_DEVICES,
+        )
+
+        if i == 0:
+            metrics.set_dimensions(
+                {
+                    "performance_test": "test_boottime_many_block_devices",
+                    "num_block_devices": str(NUM_BLOCK_DEVICES),
+                    "pool_size": str(pool_size),
+                    **vm.dimensions,
+                }
+            )
+
+        emit_boottime_metrics(vm, metrics, boot_time_us, cpu_boot_time_us)
         vm.kill()
