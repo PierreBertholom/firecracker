@@ -51,6 +51,7 @@ use crate::logger::{error, info};
 use crate::rate_limiter::TokenBucket;
 use crate::resources::VmResources;
 use crate::rpc_interface::VmmActionError;
+use crate::seccomp::BpfThreadMap;
 use crate::snapshot::Persist;
 use crate::utils::open_file_nonblock;
 use crate::vmm_config::HotplugDeviceConfig;
@@ -673,6 +674,7 @@ pub struct DeviceRestoreArgs<'a> {
     pub vcpus_exit_evt: &'a EventFd,
     pub vm_resources: &'a mut VmResources,
     pub instance_id: &'a str,
+    pub seccomp_filters: &'a BpfThreadMap,
 }
 
 impl std::fmt::Debug for DeviceRestoreArgs<'_> {
@@ -745,6 +747,7 @@ impl<'a> Persist<'a> for DeviceManager {
                     vm_resources: constructor_args.vm_resources,
                     instance_id: constructor_args.instance_id,
                     event_manager: constructor_args.event_manager,
+                    seccomp_filters: constructor_args.seccomp_filters,
                 };
                 let pci_devices = PciDevices::restore(pci_ctor_args, pci_state)
                     .map_err(DeviceManagerPersistError::PciRestore)?;
@@ -757,6 +760,7 @@ impl<'a> Persist<'a> for DeviceManager {
                     event_manager: constructor_args.event_manager,
                     vm_resources: constructor_args.vm_resources,
                     instance_id: constructor_args.instance_id,
+                    seccomp_filters: constructor_args.seccomp_filters,
                 };
                 let mmio_virtio_devices = MMIOVirtioDevices::restore(mmio_ctor_args, mmio_state)
                     .map_err(DeviceManagerPersistError::MmioRestore)?;

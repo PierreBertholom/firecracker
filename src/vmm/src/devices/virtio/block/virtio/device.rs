@@ -410,6 +410,10 @@ impl VirtioBlock {
         }
     }
 
+    pub(crate) fn set_worker_filter(&mut self, filter: Arc<BpfProgram>) {
+        self.seccomp_filter = filter;
+    }
+
     pub(crate) fn disk(&self) -> &DiskProperties { &self.resources().disk }
     pub(crate) fn rate_limiter(&self) -> &RateLimiter { &self.resources().rate_limiter }
 
