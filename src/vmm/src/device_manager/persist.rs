@@ -637,6 +637,7 @@ mod tests {
     use crate::device_manager;
     use crate::devices::virtio::block::CacheType;
     use crate::resources::VmmConfig;
+    use crate::seccomp::get_empty_filters;
     use crate::vmm_config::balloon::BalloonDeviceConfig;
     use crate::vmm_config::entropy::EntropyDeviceConfig;
     use crate::vmm_config::memory_hotplug::MemoryHotplugConfig;
@@ -783,6 +784,7 @@ mod tests {
             bitcode::deserialize(&serialized_data).unwrap();
         let vm_resources = &mut VmResources::default();
         let kvm_vm = vmm.vm.as_kvm().unwrap().clone();
+        let empty_seccomp_filters = get_empty_filters();
         let restore_args = MMIODevManagerConstructorArgs {
             mem: kvm_vm.guest_memory(),
             vm: &kvm_vm,
@@ -790,6 +792,7 @@ mod tests {
             vm_resources,
             instance_id: "microvm-id",
             serial_state: None,
+            seccomp_filters: &empty_seccomp_filters,
         };
         let _restored_dev_manager =
             MMIODeviceManager::restore(restore_args, &device_manager_state.mmio_state).unwrap();
