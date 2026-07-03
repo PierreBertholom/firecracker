@@ -811,14 +811,14 @@ mod tests {
         };
         let vm_resources = &mut VmResources::default();
         let kvm_vm = vmm.vm.as_kvm().unwrap().clone();
-        let seccomp_filters = get_empty_filters();
+        let empty_seccomp_filters = get_empty_filters();
         let restore_args = MMIODevManagerConstructorArgs {
             mem: kvm_vm.guest_memory(),
             vm: &kvm_vm,
             event_manager: &mut event_manager,
             vm_resources,
             instance_id: "microvm-id",
-            seccomp_filters: &seccomp_filters,
+            seccomp_filters: &empty_seccomp_filters,
         };
         let _restored_dev_manager = MMIOVirtioDevices::restore(restore_args, mmio_state).unwrap();
 

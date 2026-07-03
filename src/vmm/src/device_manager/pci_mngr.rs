@@ -323,11 +323,11 @@ pub struct PciDevicesState {
 }
 
 pub struct PciDevicesConstructorArgs<'a> {
-    pub vm: &'a Arc<KvmVm>,
     pub mem: &'a GuestMemoryMmap,
+    pub vm: &'a Arc<KvmVm>,
+    pub event_manager: &'a mut EventManager,
     pub vm_resources: &'a mut VmResources,
     pub instance_id: &'a str,
-    pub event_manager: &'a mut EventManager,
     pub seccomp_filters: &'a BpfThreadMap,
 }
 
