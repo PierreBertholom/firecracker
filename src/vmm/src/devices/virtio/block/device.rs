@@ -16,6 +16,7 @@ use crate::devices::virtio::queue::{InvalidAvailIdx, Queue};
 use crate::devices::virtio::transport::VirtioInterrupt;
 use crate::impl_device_type;
 use crate::rate_limiter::BucketUpdate;
+use crate::seccomp::BpfProgram;
 use crate::snapshot::Persist;
 use crate::vmm_config::drive::BlockDeviceConfig;
 use crate::vstate::memory::GuestMemoryMmap;
@@ -114,6 +115,14 @@ impl Block {
             Self::VhostUser(_) => true,
         }
     }
+
+    pub fn set_worker_filter(&mut self, f: Arc<BpfProgram>) {
+        match self {
+            Self::Virtio(b) => b.set_worker_filter(f),
+            Self::VhostUser(_) => (),
+        }
+    }
+
 }
 
 impl VirtioDevice for Block {

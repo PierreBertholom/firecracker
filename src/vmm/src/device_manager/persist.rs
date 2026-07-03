@@ -40,6 +40,7 @@ use crate::devices::virtio::vsock::persist::{
 use crate::devices::virtio::vsock::{Vsock, VsockUnixBackend};
 use crate::mmds::data_store::MmdsVersion;
 use crate::resources::VmResources;
+use crate::seccomp::BpfThreadMap;
 use crate::snapshot::Persist;
 use crate::vmm_config::memory_hotplug::MemoryHotplugConfig;
 use crate::vstate::memory::GuestMemoryMmap;
@@ -153,6 +154,7 @@ pub struct MMIODevManagerConstructorArgs<'a> {
     pub vm_resources: &'a mut VmResources,
     pub instance_id: &'a str,
     pub serial_state: Option<&'a SerialState>,
+    pub seccomp_filters: &'a BpfThreadMap,
 }
 impl fmt::Debug for MMIODevManagerConstructorArgs<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -456,6 +458,14 @@ impl<'a> Persist<'a> for MMIODeviceManager {
                 BlockConstructorArgs { mem: mem.clone() },
                 &block_state.device_state,
             )?));
+
+            device.lock()
+                .expect("Poisoned lock")
+                .set_worker_filter(constructor_args.seccomp_filters
+                    .get("blk_worker")
+                    .expect("Missing blk_worker seccomp filter")
+                    .clone()
+                );
 
             constructor_args
                 .vm_resources

@@ -712,6 +712,22 @@
                         "comment": "Ensure PROT_EXEC is not set"
                     }
                 ]
+            },
+            {
+                "syscall": "clone",
+                "comment": "Used to spawn worker thread //TODO: add args"
+            },
+            {
+                "syscall": "clone3",
+                "comment": "Used to spawn worker thread //TODO: add args"
+            },
+            {
+                "syscall": "prctl",
+                "comment": "Used to manager worker thread"
+            },
+            {
+                "syscall": "seccomp",
+                "comment": "Used to add seccomp filter to worker thread"
             }
         ]
     },
@@ -1345,6 +1361,82 @@
                         "op": "eq",
                         "val": 1075883638,
                         "comment": "KVM_IRQFD"
+                    }
+                ]
+            }
+        ]
+    },
+    "blk_worker": {
+        "default_action": "trap",
+        "filter_action": "allow",
+        "filter": [
+            {
+                "syscall": "epoll_ctl"
+            },
+            {
+                "syscall": "epoll_pwait"
+            },
+            {
+                "syscall": "read"
+            },
+            {
+                "syscall": "write"
+            },
+            {
+                "syscall": "fsync"
+            },
+            {
+                "syscall": "close"
+            },
+            {
+                "syscall": "io_uring_enter",
+                "comment": "Used for submitting io_uring requests"
+            },
+            {
+                "syscall": "brk",
+                "comment": "Called for expanding the heap"
+            },
+            {
+                "syscall": "gettid",
+                "comment": "Rust std uses it during panic to print the thread id."
+            },
+            {
+                "syscall": "clock_gettime",
+                "comment": "Used for metrics and logging, via the helpers in utils/src/time.rs. It's not called on some platforms, because of vdso optimisations."
+            },
+            {
+                "syscall": "ftruncate",
+                "comment": "Used for snapshotting"
+            },
+            {
+                "syscall": "timerfd_create",
+                "comment": "Needed for creating rate limiters during device hotplug",
+                "args": [
+                    {
+                        "index": 0,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 1,
+                        "comment": "CLOCK_MONOTONIC"
+                    },
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 526336,
+                        "comment": "TFD_NONBLOCK | TFD_CLOEXEC"
+                    }
+                ]
+            },
+            {
+                "syscall": "timerfd_settime",
+                "comment": "Needed for rate limiting and metrics",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 0
                     }
                 ]
             }

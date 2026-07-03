@@ -7,7 +7,7 @@ use std::path::Path;
 
 use vmm::seccomp::{BpfThreadMap, DeserializationError, deserialize_binary, get_empty_filters};
 
-const THREAD_CATEGORIES: [&str; 3] = ["vmm", "api", "vcpu"];
+const THREAD_CATEGORIES: [&str; 4] = ["vmm", "api", "vcpu", "blk_worker"];
 
 /// Error retrieving seccomp filters.
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
@@ -117,16 +117,18 @@ mod tests {
     #[test]
     fn test_get_filters() {
         let mut filters = get_empty_filters();
-        assert_eq!(filters.len(), 3);
+        assert_eq!(filters.len(), 4);
         assert!(filters.remove("vmm").is_some());
         assert!(filters.remove("api").is_some());
         assert!(filters.remove("vcpu").is_some());
+        assert!(filters.remove("blk_worker").is_some());
 
         let mut filters = get_empty_filters();
-        assert_eq!(filters.len(), 3);
+        assert_eq!(filters.len(), 4);
         assert_eq!(filters.remove("vmm").unwrap().len(), 0);
         assert_eq!(filters.remove("api").unwrap().len(), 0);
         assert_eq!(filters.remove("vcpu").unwrap().len(), 0);
+        assert_eq!(filters.remove("blk_worker").unwrap().len(), 0);
 
         let file = TempFile::new().unwrap().into_file();
 
@@ -140,8 +142,9 @@ mod tests {
         map.insert("vcpu".to_string(), Arc::new(vec![]));
         map.insert("vmm".to_string(), Arc::new(vec![]));
         map.insert("api".to_string(), Arc::new(vec![]));
+        map.insert("blk_worker".to_string(), Arc::new(vec![]));
 
-        assert_eq!(filter_thread_categories(map).unwrap().len(), 3);
+        assert_eq!(filter_thread_categories(map).unwrap().len(), 4);
 
         // invalid categories
         let mut map = BpfThreadMap::new();
