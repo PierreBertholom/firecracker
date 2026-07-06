@@ -10,7 +10,7 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::thread::{self, JoinHandle};
 use event_manager::{EventOps, Events, MutEventSubscriber, SubscriberOps};
 use crate::EventManager;
-use crate::devices::virtio::block::virtio::device::BlockResources;
+use crate::devices::virtio::block::virtio::device::{BlockResources, ThreadedActive};
 use crate::devices::virtio::block::virtio::metrics::BlockDeviceMetrics;
 use crate::devices::virtio::block::virtio::{FinishedRequest, IoErr, ProcessingResult, Request, VirtioBlockError};
 use crate::devices::virtio::device::ActiveState;
@@ -18,6 +18,7 @@ use crate::rate_limiter::BucketUpdate;
 use crate::seccomp::{BpfProgram, apply_filter};
 use vmm_sys_util::epoll::EventSet;
 use vmm_sys_util::eventfd::EventFd;
+use crate::devices::virtio::block::CacheType;
 use crate::devices::virtio::block::virtio::io::{async_io, FileEngine};
 use crate::devices::virtio::queue::InvalidAvailIdx;
 use crate::devices::virtio::transport::VirtioInterruptType;
@@ -33,7 +34,7 @@ pub(crate) struct BlockWorker {
 
 #[derive(Debug)]
 pub(crate) struct ThreadedWorker {
-    worker: BlockWorker,
+    pub(crate) worker: BlockWorker,
     control_evt: EventFd,
 }
 
@@ -42,12 +43,18 @@ enum WorkerState {
     Paused,
     Finished,
 }
+
+pub(crate) enum FlushMode {
+    Drain,
+    DrainAndFlush,
+}
 enum ControlMsg {
     UpdateDiskImage(String),
     UpdateRateLimiter(BucketUpdate, BucketUpdate),
+    Kick,
     Pause,
     Resume,
-    Finish,
+    Finish(FlushMode),
 }
 
 enum ControlResponse {
@@ -61,6 +68,18 @@ pub(crate) struct WorkerHandle {
     receiver_rx: Receiver<ControlResponse>,
     control_evt: EventFd,
     join: JoinHandle<()>,
+}
+
+macro_rules! unwrap_async_file_engine_or_return {
+    ($file_engine: expr) => {
+        match $file_engine {
+            FileEngine::Async(engine) => engine,
+            FileEngine::Sync(_) => {
+                error!("The block device doesn't use an async IO engine");
+                return;
+            }
+        }
+    };
 }
 
 impl WorkerHandle {
@@ -82,7 +101,7 @@ impl WorkerHandle {
         let join = thread::Builder::new()
             .name("fc_blk_worker".to_owned())
             .spawn(move || {
-                // epoll first (forbidden by seccomp), then register, then lock down.
+                // epoll first (not in seccomp), then register, then lock down.
                 let mut event_manager = EventManager::new()
                     .expect("Failed to create block worker EventManager");
 
@@ -106,19 +125,30 @@ impl WorkerHandle {
             worker_arc,
         ))
     }
-}
 
-
-macro_rules! unwrap_async_file_engine_or_return {
-    ($file_engine: expr) => {
-        match $file_engine {
-            FileEngine::Async(engine) => engine,
-            FileEngine::Sync(_) => {
-                error!("The block device doesn't use an async IO engine");
-                return;
-            }
+    pub(crate) fn finish(self, flush_mode: FlushMode) {
+        if let Err(e) = self.control_tx.send(ControlMsg::Finish(flush_mode)) {
+            error!("Block receiver already dropped on teardown: {:?}", e);
         }
-    };
+
+        if let Err(e) = self.control_evt.write(1) {
+            error!("Block control event is closed on teardown: {:?}", e);
+        }
+
+        if let Err(e) = self.join.join() {
+            error!("Block worker thread panicking during teardown: {:?}", e);
+        }
+    }
+
+    pub(crate) fn kick(&self) {
+        if let Err(e) = self.control_tx.send(ControlMsg::Kick) {
+            error!("Block receiver dropped on kick: {:?}", e);
+        }
+
+        if let Err(e) = self.control_evt.write(1) {
+            error!("Block control event is closed on kick: {:?}", e);
+        }
+    }
 }
 
 impl BlockWorker {
@@ -435,7 +465,24 @@ fn process_control_msg(worker_arc: &Arc<Mutex<ThreadedWorker>>, response_tx: &Se
             WorkerState::Paused
         }
         ControlMsg::Resume => WorkerState::Running,
-        ControlMsg::Finish => WorkerState::Finished,
+        ControlMsg::Kick => {
+            worker_arc.lock()
+                .expect("Poisoned block worker lock")
+                .worker
+                // process directly instead of going through epoll (regular kick)
+                .process_virtio_queues()
+                .unwrap_or_else(|e| error!("Kick queue processing failed: {:?}",e));
+            WorkerState::Running
+        },
+        ControlMsg::Finish(flush_mode) => {
+            let w = &mut worker_arc.lock().expect("Poisoned block worker lock").worker;
+            match flush_mode {
+                FlushMode::Drain => w.drain(true),
+                FlushMode::DrainAndFlush => w.drain_and_flush(true),
+            }
+            w.resources.is_io_engine_throttled = false;
+            WorkerState::Finished
+        },
     }
 }
 
