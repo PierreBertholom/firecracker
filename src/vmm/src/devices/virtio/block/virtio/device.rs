@@ -27,7 +27,7 @@ use crate::devices::virtio::ActivateError;
 use crate::devices::virtio::block::CacheType;
 use crate::devices::virtio::block::device::Block;
 use crate::devices::virtio::block::virtio::metrics::{BlockDeviceMetrics, BlockMetricsPerDevice};
-use crate::devices::virtio::block::virtio::worker::{BlockWorker, ThreadedWorker, WorkerHandle};
+use crate::devices::virtio::block::virtio::worker::{BlockWorker, FlushMode, ThreadedWorker, WorkerHandle};
 use crate::devices::virtio::device::{ActiveState, DeviceState, VirtioDevice, VirtioDeviceType};
 use crate::devices::virtio::generated::virtio_blk::{
     VIRTIO_BLK_F_FLUSH, VIRTIO_BLK_F_RO, VIRTIO_BLK_ID_BYTES,
@@ -269,12 +269,14 @@ pub struct VirtioBlock {
 // TRW: review scope — pub(crate) only so persist.rs can construct on restore.
 #[derive(Debug)]
 pub(crate) enum BlockState {
-    // MMIO sets configuration inplace before activation
+    // Transport layer sets configuration inplace before activation
     Configuring(BlockResources),
     // Transition state when moving resources to worker
-    Activating,
+    Activating(BlockWorker),
     // Active state, worker owns data-path resources
     Active(ActiveBlock),
+    // Placeholder to hold state when activating
+    Placeholder,
 }
 
 /// Data-path resources owned by worker
@@ -395,18 +397,20 @@ impl VirtioBlock {
     fn resources(&self) -> &BlockResources {
         match &self.state {
             BlockState::Configuring(res) => res,
+            BlockState::Activating(worker) => &worker.resources,
             BlockState::Active(ActiveBlock::Inline(ab)) => &ab.worker.resources,
             BlockState::Active(ActiveBlock::Threaded(_)) => unreachable!("to be handled cleanly"), // TRW
-            BlockState::Activating  => unreachable!("resources() called during activation"),
+            BlockState::Placeholder => unreachable!("not a runtime state"),
         }
     }
 
     pub(crate) fn resources_mut(&mut self) -> &mut BlockResources {
         match &mut self.state {
             BlockState::Configuring(res) => res,
+            BlockState::Activating(worker) => &mut worker.resources,
             BlockState::Active(ActiveBlock::Inline(ab)) => &mut ab.worker.resources,
             BlockState::Active(ActiveBlock::Threaded(_)) => unreachable!("to be handled cleanly"), // TRW
-            BlockState::Activating => unreachable!("resources_mut() called during activation"),
+            BlockState::Placeholder => unreachable!("not a runtime state"),
         }
     }
 
@@ -420,7 +424,7 @@ impl VirtioBlock {
     /// Retrieve the file engine type.
     pub(crate) fn file_engine_type(&self) -> FileEngineType {
         match self.disk().file_engine {
-            FileEngine::Sync(_)  => FileEngineType::Sync,
+            FileEngine::Sync(_) => FileEngineType::Sync,
             FileEngine::Async(_) => FileEngineType::Async,
         }
     }
@@ -511,10 +515,10 @@ impl VirtioBlock {
         }
         if let FileEngine::Async(ref engine) = self.resources().disk.file_engine
             && let Err(err) = ops.add(Events::with_data(
-                engine.completion_evt(),
-                Self::PROCESS_ASYNC_COMPLETION,
-                EventSet::IN,
-            ))
+            engine.completion_evt(),
+            Self::PROCESS_ASYNC_COMPLETION,
+            EventSet::IN,
+        ))
         {
             error!("Failed to register IO engine completion event: {}", err);
         }
@@ -530,7 +534,7 @@ impl VirtioBlock {
         }
     }
 
-    fn process_activate_event(&self, ops: &mut EventOps) {
+    fn process_activate_event(&mut self, ops: &mut EventOps) {
         if let Err(err) = self.activate_evt.read() {
             error!("Failed to consume block activate event: {:?}", err);
         }
@@ -549,6 +553,11 @@ impl VirtioBlock {
         )) {
             error!("Failed to un-register activate event: {}", err);
         }
+
+        if let Err(err) = self.finalize_activation() {
+            self.metrics.activate_fails.inc();
+            error!("Failed to finalize block activation: {}", err);
+        }
     }
 
     pub(crate) fn init_events(&mut self, ops: &mut EventOps) {
@@ -560,34 +569,44 @@ impl VirtioBlock {
     }
 
     pub(crate) fn process_event(&mut self, source: u32, ops: &mut EventOps) {
-        if !self.is_activated() {
-            warn!("Block: The device is not yet activated. Spurious event received: {source:?}");
-            return;
-        }
-
-        match source {
-            Self::PROCESS_ACTIVATE => self.process_activate_event(ops),
-            Self::PROCESS_QUEUE | Self::PROCESS_RATE_LIMITER | Self::PROCESS_ASYNC_COMPLETION => {
-                if let BlockState::Active(ActiveBlock::Inline(ab)) = &mut self.state {
-                    match source {
-                        Self::PROCESS_QUEUE => ab.worker.process_queue_event(),
-                        Self::PROCESS_RATE_LIMITER => ab.worker.process_rate_limiter_event(),
-                        Self::PROCESS_ASYNC_COMPLETION => ab.worker.process_async_completion_event(),
-                        _ => unreachable!(),
+        if self.is_activated() {
+            match source {
+                Self::PROCESS_ACTIVATE => self.process_activate_event(ops),
+                Self::PROCESS_QUEUE | Self::PROCESS_RATE_LIMITER | Self::PROCESS_ASYNC_COMPLETION => {
+                    if let BlockState::Active(ActiveBlock::Inline(ab)) = &mut self.state {
+                        match source {
+                            Self::PROCESS_QUEUE => ab.worker.process_queue_event(),
+                            Self::PROCESS_RATE_LIMITER => ab.worker.process_rate_limiter_event(),
+                            Self::PROCESS_ASYNC_COMPLETION => ab.worker.process_async_completion_event(),
+                            _ => unreachable!(),
+                        }
                     }
                 }
+                _ => warn!("Block: Spurious event received: {source:?}"),
             }
-            _ => warn!("Block: Spurious event received: {source:?}"),
+        } else {
+            warn!(
+                "Block: The device is not yet activated. Spurious event received: {:?}",
+                source
+            );
+            match source {
+                Self::PROCESS_QUEUE => self.drain_queue_events(),
+                Self::PROCESS_RATE_LIMITER => {
+                    self.resources_mut().rate_limiter.event_handler();
+                }
+                Self::PROCESS_ASYNC_COMPLETION => {
+                    if let FileEngine::Async(ref engine) = self.resources().disk.file_engine {
+                        engine.completion_evt().read();
+                    }
+                }
+                _ => (),
+            }
         }
     }
 }
 
 impl VirtioDevice for VirtioBlock {
     impl_device_type!(VirtioDeviceType::Block);
-
-    fn id(&self) -> &str {
-        &self.id
-    }
 
     fn avail_features(&self) -> u64 {
         self.avail_features
@@ -600,6 +619,10 @@ impl VirtioDevice for VirtioBlock {
     fn set_acked_features(&mut
                           self, acked_features: u64) {
         self.acked_features = acked_features;
+    }
+
+    fn id(&self) -> &str {
+        &self.id
     }
 
     fn queues(&self) -> &[Queue] {
@@ -658,7 +681,7 @@ impl VirtioDevice for VirtioBlock {
         }
 
         let BlockState::Configuring(mut res) =
-            std::mem::replace(&mut self.state, BlockState::Activating)
+            std::mem::replace(&mut self.state, BlockState::Placeholder)
         else {
             unreachable!("state checked to be Configuring above");
         };
@@ -675,25 +698,13 @@ impl VirtioDevice for VirtioBlock {
             }
         }
 
-        // save final queue config state for MMIO reads
-        let queue_cfg = res.queues.iter().map(QueueConfig::from).collect();
-
-        // create data path - TRW: will be handed to worker thread in multithread mode
         let worker = BlockWorker {
             resources: res,
             active_state: ActiveState { mem, interrupt },
             metrics: self.metrics.clone(),
         };
 
-        if self.threaded {
-            let (worker_handle, worker_arc) =
-                WorkerHandle::spawn(worker, self.seccomp_filter.clone())
-                    .map_err(ActivateError::ThreadSpawn)?;
-            self.state =
-                BlockState::Active(ActiveBlock::Threaded(ThreadedActive { worker_handle, worker_arc, queue_cfg }));
-        } else {
-            self.state = BlockState::Active(ActiveBlock::Inline(InlineActive { worker, queue_cfg }));
-        }
+        self.state = BlockState::Activating(worker);
 
         if self.activate_evt.write(1).is_err() {
             self.metrics.activate_fails.inc();
@@ -706,30 +717,87 @@ impl VirtioDevice for VirtioBlock {
     fn is_activated(&self) -> bool { matches!(self.state, BlockState::Active(_)) }
 
     fn deactivate(&mut self) {
-        self.device_state = DeviceState::Inactive;
+        let res = match std::mem::replace(&mut self.state, BlockState::Placeholder) {
+            BlockState::Active(ActiveBlock::Threaded(ab)) => ab.teardown(FlushMode::Drain),
+            BlockState::Active(ActiveBlock::Inline(mut ab)) => {
+                ab.worker.drain(true);
+                ab.worker.resources
+            }
+            other => {self.state = other; return; }
+        };
+        self.state = BlockState::Configuring(res);
     }
 
-    fn _reset(&mut self) -> bool {
-        if let Err(err) = self.disk.file_engine.drain(true) {
-            error!("Failed to reset block IO engine: {:?}", err);
-            return false;
+    fn _reset(&mut self) -> bool { true }
+
+    fn kick(&mut self) {
+        match &self.state {
+            BlockState::Active(ActiveBlock::Threaded(ab)) => ab.worker_handle.kick(),
+            BlockState::Active(ActiveBlock::Inline(_)) => self.notify_queue_events(),
+            _ => {} // not active = nothing to kick
         }
-        self.is_io_engine_throttled = false;
-        true
+    }
+
+    fn finalize_activation(&mut self) -> Result<(), ActivateError> {
+        if !matches!(self.state, BlockState::Activating(_)) {
+            return Ok(());
+        }
+
+        let BlockState::Activating(mut worker) =
+            std::mem::replace(&mut self.state, BlockState::Placeholder)
+        else {
+            unreachable!("state checked to be Activating above");
+        };
+
+        // save final queue config state for MMIO reads
+        let queue_cfg = worker.resources.queues.iter().map(QueueConfig::from).collect();
+
+        if self.threaded {
+            let (worker_handle, worker_arc) =
+                WorkerHandle::spawn(worker, self.seccomp_filter.clone())
+                    .map_err(ActivateError::ThreadSpawn)?;
+            self.state = BlockState::Active(ActiveBlock::Threaded(ThreadedActive { worker_handle, worker_arc, queue_cfg }));
+        } else {
+            self.state = BlockState::Active(ActiveBlock::Inline(InlineActive { worker, queue_cfg }));
+        }
+
+        Ok(())
+    }
+}
+
+impl ThreadedActive {
+    fn teardown(self, flush_mode: FlushMode) -> BlockResources {
+        self.worker_handle.finish(flush_mode);
+
+        Arc::try_unwrap(self.worker_arc)
+            .expect("Block worker refs outlived join") // post-join expect count = 1
+            .into_inner()
+            .expect("Poisoned lock")
+            .worker
+            .resources
     }
 }
 
 impl Drop for VirtioBlock {
     fn drop(&mut self) {
-        let cache_type = self.cache_type;
-        if let BlockState::Active(ActiveBlock::Inline(ab)) = &mut self.state {
-            match cache_type {
-                CacheType::Unsafe => ab.worker.drain(true),
-                CacheType::Writeback => ab.worker.drain_and_flush(true),
+        let flush_mode = match self.cache_type {
+            CacheType::Unsafe => FlushMode::Drain,
+            CacheType::Writeback => FlushMode::DrainAndFlush,
+        };
+        match std::mem::replace(&mut self.state, BlockState::Placeholder)
+        {
+            BlockState::Active(ActiveBlock::Threaded(ab)) => { let _ = ab.teardown(flush_mode); },
+            BlockState::Active(ActiveBlock::Inline(mut ab)) => {
+                match flush_mode {
+                    FlushMode::Drain => { ab.worker.drain(true); },
+                    FlushMode::DrainAndFlush => { ab.worker.drain_and_flush(true); },
+                }
             }
+            _ => {}
         };
     }
 }
+
 
 #[cfg(test)]
 mod tests {

@@ -128,13 +128,6 @@ impl Block {
 impl VirtioDevice for Block {
     impl_device_type!(VirtioDeviceType::Block);
 
-    fn id(&self) -> &str {
-        match self {
-            Self::Virtio(b) => b.id(),
-            Self::VhostUser(b) => b.id(),
-        }
-    }
-
     fn avail_features(&self) -> u64 {
         match self {
             Self::Virtio(b) => b.avail_features,
@@ -153,6 +146,13 @@ impl VirtioDevice for Block {
         match self {
             Self::Virtio(b) => b.acked_features = acked_features,
             Self::VhostUser(b) => b.acked_features = acked_features,
+        }
+    }
+
+    fn id(&self) -> &str {
+        match self {
+            Self::Virtio(b) => b.id(),
+            Self::VhostUser(b) => b.id(),
         }
     }
 
@@ -230,10 +230,24 @@ impl VirtioDevice for Block {
         }
     }
 
+    fn kick(&mut self) {
+        match self {
+            Self::Virtio(b) => b.kick(),
+            Self::VhostUser(b) => b.kick(),
+        }
+    }
+
     fn prepare_save(&mut self) {
         match self {
             Self::Virtio(b) => b.prepare_save(),
             Self::VhostUser(b) => b.prepare_save(),
+        }
+    }
+
+    fn finalize_activation(&mut self) -> Result<(), ActivateError> {
+        match self {
+            Self::Virtio(b) => b.finalize_activation(),
+            Self::VhostUser(b) => Ok(()),
         }
     }
 }

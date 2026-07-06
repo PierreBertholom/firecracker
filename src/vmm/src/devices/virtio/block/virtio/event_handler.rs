@@ -19,32 +19,6 @@ impl MutEventSubscriber for VirtioBlock {
         }
 
         self.process_event(source, ops);
-        if self.is_activated() {
-            match source {
-                Self::PROCESS_ACTIVATE => self.process_activate_event(ops),
-                Self::PROCESS_QUEUE => self.process_queue_event(),
-                Self::PROCESS_RATE_LIMITER => self.process_rate_limiter_event(),
-                Self::PROCESS_ASYNC_COMPLETION => self.process_async_completion_event(),
-                _ => warn!("Block: Spurious event received: {:?}", source),
-            }
-        } else {
-            warn!(
-                "Block: The device is not yet activated. Spurious event received: {:?}",
-                source
-            );
-            match source {
-                Self::PROCESS_QUEUE => self.drain_queue_events(),
-                Self::PROCESS_RATE_LIMITER => {
-                    self.rate_limiter.event_handler();
-                }
-                Self::PROCESS_ASYNC_COMPLETION => {
-                    if let FileEngine::Async(ref engine) = self.disk.file_engine {
-                        engine.completion_evt().read();
-                    }
-                }
-                _ => (),
-            }
-        }
     }
 
     fn init(&mut self, ops: &mut EventOps) {
