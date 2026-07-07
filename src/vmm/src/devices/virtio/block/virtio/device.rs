@@ -193,6 +193,10 @@ pub struct VirtioBlockConfig {
     /// If set to true, the drive is opened in read-only mode. Otherwise, the
     /// drive is opened as read-write.
     pub is_read_only: bool,
+    /// Toggle for multithreaded device
+    // default to false
+    #[serde(default)]
+    pub threaded: bool,
     /// Path of the backing file on the host
     pub path_on_host: String,
     /// Rate Limiter for I/O operations.
@@ -215,6 +219,7 @@ impl TryFrom<&BlockDeviceConfig> for VirtioBlockConfig {
                 cache_type: value.cache_type,
 
                 is_read_only: value.is_read_only.unwrap_or(false),
+                threaded: value.threaded,
                 path_on_host: path_on_host.clone(),
                 rate_limiter: value.rate_limiter,
                 file_engine_type: value.file_engine_type.unwrap_or_default(),
@@ -234,6 +239,7 @@ impl From<VirtioBlockConfig> for BlockDeviceConfig {
             cache_type: value.cache_type,
 
             is_read_only: Some(value.is_read_only),
+            threaded: value.threaded,
             path_on_host: Some(value.path_on_host),
             rate_limiter: value.rate_limiter,
             file_engine_type: Some(value.file_engine_type),
@@ -387,7 +393,7 @@ impl VirtioBlock {
             root_device: config.is_root_device,
             read_only: config.is_read_only,
 
-            threaded: false,
+            threaded: config.threaded,
             state: BlockState::Configuring(blk_resources),
             metrics: BlockMetricsPerDevice::alloc(config.drive_id),
             seccomp_filter: Arc::new(vec![]),
@@ -438,6 +444,7 @@ impl VirtioBlock {
             is_root_device: self.root_device,
             partuuid: self.partuuid.clone(),
             is_read_only: self.read_only,
+            threaded: self.threaded,
             cache_type: self.cache_type,
             rate_limiter: rl.into_option(),
             file_engine_type: self.file_engine_type(),
@@ -831,6 +838,7 @@ mod tests {
             cache_type: CacheType::Unsafe,
 
             is_read_only: Some(true),
+            threaded: false,
             path_on_host: Some("path".to_string()),
             rate_limiter: None,
             file_engine_type: Default::default(),
@@ -846,6 +854,7 @@ mod tests {
             cache_type: CacheType::Unsafe,
 
             is_read_only: None,
+            threaded: false,
             path_on_host: None,
             rate_limiter: None,
             file_engine_type: Default::default(),
@@ -861,6 +870,7 @@ mod tests {
             cache_type: CacheType::Unsafe,
 
             is_read_only: Some(true),
+            threaded: false,
             path_on_host: Some("path".to_string()),
             rate_limiter: None,
             file_engine_type: Default::default(),

@@ -97,6 +97,7 @@ impl From<VhostUserBlockConfig> for BlockDeviceConfig {
             cache_type: value.cache_type,
 
             is_read_only: None,
+            threaded: false,
             path_on_host: None,
             rate_limiter: None,
             file_engine_type: None,
@@ -413,6 +414,7 @@ mod tests {
             cache_type: CacheType::Unsafe,
 
             is_read_only: None,
+            threaded: false,
             path_on_host: None,
             rate_limiter: None,
             file_engine_type: None,
@@ -428,6 +430,7 @@ mod tests {
             cache_type: CacheType::Unsafe,
 
             is_read_only: Some(true),
+            threaded: false,
             path_on_host: Some("path".to_string()),
             rate_limiter: None,
             file_engine_type: Some(FileEngineType::Sync),
@@ -443,6 +446,7 @@ mod tests {
             cache_type: CacheType::Unsafe,
 
             is_read_only: Some(true),
+            threaded: false,
             path_on_host: Some("path".to_string()),
             rate_limiter: None,
             file_engine_type: Some(FileEngineType::Sync),
@@ -827,7 +831,7 @@ mod tests {
         vhost_block.queues[0] = q.create_queue();
         let interrupt = default_interrupt();
 
-        // During actiavion of the device features, memory and queues should be set and activated.
+        // During activation of the device features, memory and queues should be set and activated.
         vhost_block.activate(guest_memory, interrupt).unwrap();
         assert!(unsafe { *vhost_block.vu_handle.vu.features_are_set.get() });
         assert!(unsafe { *vhost_block.vu_handle.vu.memory_is_set.get() });
