@@ -1238,6 +1238,12 @@ definitions:
         description:
           Is block read only.
           This field is required for virtio-block config and should be omitted for vhost-user-block configuration.
+      threaded:
+        type: boolean
+        description:
+          Is multi-threaded on.
+          This field is required for virtio-block config and should be omitted for vhost-user-block configuration.
+        default: false
       path_on_host:
         type: string
         description:

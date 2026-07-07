@@ -61,6 +61,8 @@ pub struct VirtioBlockState {
     pub virtio_state: VirtioDeviceState,
     rate_limiter_state: RateLimiterState,
     file_engine_type: FileEngineTypeState,
+    #[serde(default)]
+    threaded: bool,
 }
 
 impl Persist<'_> for VirtioBlock {
@@ -79,6 +81,7 @@ impl Persist<'_> for VirtioBlock {
             virtio_state: VirtioDeviceState::from_device(self),
             rate_limiter_state: self.rate_limiter().save(),
             file_engine_type: FileEngineTypeState::from(self.file_engine_type()),
+            threaded: self.threaded,
         }
     }
 
@@ -135,7 +138,7 @@ impl Persist<'_> for VirtioBlock {
             root_device: state.root_device,
             read_only: is_read_only,
 
-            threaded: false,
+            threaded: state.threaded,
             state: BlockState::Configuring(blk_resources),
             metrics: BlockMetricsPerDevice::alloc(state.id.clone()),
             seccomp_filter: Arc::new(vec![]),
@@ -164,6 +167,7 @@ mod tests {
             is_root_device: false,
             partuuid: None,
             is_read_only: false,
+            threaded: false,
             cache_type: CacheType::Writeback,
             rate_limiter: None,
             file_engine_type: FileEngineType::default(),
@@ -205,6 +209,7 @@ mod tests {
             is_root_device: false,
             partuuid: None,
             is_read_only: false,
+            threaded: false,
             cache_type: CacheType::Unsafe,
             rate_limiter: None,
             file_engine_type: FileEngineType::default(),
