@@ -12,7 +12,7 @@ use std::io::{Seek, SeekFrom};
 use std::ops::Deref;
 use std::os::linux::fs::MetadataExt;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use block_io::FileEngine;
 use event_manager::{EventOps, Events};
 use serde::{Deserialize, Serialize};
@@ -27,7 +27,7 @@ use crate::devices::virtio::ActivateError;
 use crate::devices::virtio::block::CacheType;
 use crate::devices::virtio::block::device::Block;
 use crate::devices::virtio::block::virtio::metrics::{BlockDeviceMetrics, BlockMetricsPerDevice};
-use crate::devices::virtio::block::virtio::worker::{BlockWorker, FlushMode, ThreadedWorker, WorkerHandle};
+use crate::devices::virtio::block::virtio::worker::{BlockWorker, FlushMode, WorkerHandle};
 use crate::devices::virtio::device::{ActiveState, DeviceState, VirtioDevice, VirtioDeviceType};
 use crate::devices::virtio::generated::virtio_blk::{
     VIRTIO_BLK_F_FLUSH, VIRTIO_BLK_F_RO, VIRTIO_BLK_ID_BYTES,
@@ -319,7 +319,6 @@ pub(crate) struct InlineActive {
 #[derive(Debug)]
 pub(crate) struct ThreadedActive {
     worker_handle: WorkerHandle,
-    worker_arc: Arc<Mutex<ThreadedWorker>>,
     queue_cfg: Vec<QueueConfig>,
 }
 
@@ -760,10 +759,10 @@ impl VirtioDevice for VirtioBlock {
         let queue_cfg = worker.resources.queues.iter().map(QueueConfig::from).collect();
 
         if self.threaded {
-            let (worker_handle, worker_arc) =
+            let worker_handle =
                 WorkerHandle::spawn(worker, self.seccomp_filter.clone())
                     .map_err(ActivateError::ThreadSpawn)?;
-            self.state = BlockState::Active(ActiveBlock::Threaded(ThreadedActive { worker_handle, worker_arc, queue_cfg }));
+            self.state = BlockState::Active(ActiveBlock::Threaded(ThreadedActive { worker_handle, queue_cfg }));
         } else {
             self.state = BlockState::Active(ActiveBlock::Inline(InlineActive { worker, queue_cfg }));
         }
@@ -774,14 +773,9 @@ impl VirtioDevice for VirtioBlock {
 
 impl ThreadedActive {
     fn teardown(self, flush_mode: FlushMode) -> BlockResources {
-        self.worker_handle.finish(flush_mode);
-
-        Arc::try_unwrap(self.worker_arc)
-            .expect("Block worker refs outlived join") // post-join expect count = 1
-            .into_inner()
-            .expect("Poisoned lock")
-            .worker
-            .resources
+        self.worker_handle
+            .finish(flush_mode)
+            .expect("active threaded worker returns its resources on teardown")
     }
 }
 

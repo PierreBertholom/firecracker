@@ -10,7 +10,7 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::thread::{self, JoinHandle};
 use event_manager::{EventOps, Events, MutEventSubscriber, SubscriberOps};
 use crate::EventManager;
-use crate::devices::virtio::block::virtio::device::{BlockResources, ThreadedActive};
+use crate::devices::virtio::block::virtio::device::BlockResources;
 use crate::devices::virtio::block::virtio::metrics::BlockDeviceMetrics;
 use crate::devices::virtio::block::virtio::{FinishedRequest, IoErr, ProcessingResult, Request, VirtioBlockError};
 use crate::devices::virtio::device::ActiveState;
@@ -48,7 +48,10 @@ pub(crate) enum FlushMode {
     Drain,
     DrainAndFlush,
 }
+
+#[allow(clippy::large_enum_variant)]
 enum ControlMsg {
+    Start(BlockWorker),
     UpdateDiskImage(String),
     UpdateRateLimiter(BucketUpdate, BucketUpdate),
     Kick,
@@ -67,7 +70,7 @@ pub(crate) struct WorkerHandle {
     control_tx: Sender<ControlMsg>,
     receiver_rx: Receiver<ControlResponse>,
     control_evt: EventFd,
-    join: JoinHandle<()>,
+    join: JoinHandle<Option<BlockResources>>,
 }
 
 macro_rules! unwrap_async_file_engine_or_return {
@@ -86,7 +89,7 @@ impl WorkerHandle {
     pub(crate) fn spawn(
         worker: BlockWorker,
         seccomp_filter: Arc<BpfProgram>,
-    ) -> Result<(WorkerHandle, Arc<Mutex<ThreadedWorker>>), std::io::Error> {
+    ) -> Result<WorkerHandle, std::io::Error> {
         // One kick eventfd, shared between worker (registers on its epoll) and shell (writes to
         // wake it). Both refer to the same kernel object via try_clone.
         let control_evt = EventFd::new(libc::EFD_NONBLOCK)?;
@@ -95,9 +98,6 @@ impl WorkerHandle {
         let (control_tx, control_rx) = channel::<ControlMsg>();
         let (response_tx, receiver_rx) = channel::<ControlResponse>();
 
-        let worker_arc = Arc::new(Mutex::new(ThreadedWorker { worker, control_evt }));
-        let loop_arc = Arc::clone(&worker_arc);
-
         let join = thread::Builder::new()
             .name("fc_blk_worker".to_owned())
             .spawn(move || {
@@ -105,28 +105,31 @@ impl WorkerHandle {
                 let mut event_manager = EventManager::new()
                     .expect("Failed to create block worker EventManager");
 
-                let subscriber: Arc<Mutex<dyn MutEventSubscriber>> = loop_arc.clone();
-                event_manager.add_subscriber(subscriber);
-
                 if let Err(err) = apply_filter(&seccomp_filter) {
                     panic!("Failed to apply seccomp filter on block worker: {err}");
                 }
-
-                run_worker_loop(loop_arc, event_manager, control_rx, response_tx);
+                run_worker_loop(event_manager, control_evt, control_rx, response_tx)
             })?;
 
-        Ok((
-            WorkerHandle {
-                control_tx,
-                receiver_rx,
-                control_evt: handle_evt,
-                join,
-            },
-            worker_arc,
-        ))
+        Ok(WorkerHandle {
+            control_tx,
+            receiver_rx,
+            control_evt: handle_evt,
+            join,
+        })
     }
 
-    pub(crate) fn finish(self, flush_mode: FlushMode) {
+    pub(crate) fn start(&self, worker: BlockWorker) {
+        if let Err(e) = self.control_tx.send(ControlMsg::Start(worker)) {
+            error!("Failed to send start message: {:?}", e);
+        }
+
+        if let Err(e) = self.control_evt.write(1) {
+            error!("Failed to notify worker: {:?}", e);
+        }
+    }
+
+    pub(crate) fn finish(self, flush_mode: FlushMode) -> Option<BlockResources> {
         if let Err(e) = self.control_tx.send(ControlMsg::Finish(flush_mode)) {
             error!("Block receiver already dropped on teardown: {:?}", e);
         }
@@ -135,9 +138,10 @@ impl WorkerHandle {
             error!("Block control event is closed on teardown: {:?}", e);
         }
 
-        if let Err(e) = self.join.join() {
+        self.join.join().unwrap_or_else(|e| {
             error!("Block worker thread panicking during teardown: {:?}", e);
-        }
+            None
+        })
     }
 
     pub(crate) fn kick(&self) {
@@ -416,7 +420,23 @@ impl ThreadedWorker {
     }
 }
 
-fn run_worker_loop(worker_arc: Arc<Mutex<ThreadedWorker>>, mut event_manager: EventManager, control_rx: Receiver<ControlMsg>, response_tx: Sender<ControlResponse>) {
+fn run_worker_loop(mut event_manager: EventManager, control_evt: EventFd, control_rx: Receiver<ControlMsg>, response_tx: Sender<ControlResponse>) -> Option<BlockResources> {
+    // pre-activation - parked waiting on Start msg. Resources still live shell-side, so a
+    // Finish (or a dropped channel) here hands nothing back
+    let worker = loop {
+        match control_rx.recv() {
+            Ok(ControlMsg::Start(w)) => break w,
+            Ok(ControlMsg::Finish(_)) => return None,
+            Ok(_) => {warn!("Control message before device activation, ignoring");},
+            Err(_) => return None,
+        }
+    };
+
+    // post-activation - active
+    let worker_arc = Arc::new(Mutex::new(ThreadedWorker { worker, control_evt }));
+    let loop_arc = Arc::clone(&worker_arc);
+    event_manager.add_subscriber(loop_arc);
+
     let mut state = WorkerState::Running;
 
     loop {
@@ -440,10 +460,23 @@ fn run_worker_loop(worker_arc: Arc<Mutex<ThreadedWorker>>, mut event_manager: Ev
             WorkerState::Finished => break,
         }
     }
+
+    // Finished state - teardown. Drop the EventManager FIRST to release the subscriber clone
+    // it holds, so `worker_arc` reaches strong_count == 1 and `try_unwrap` succeeds.
+    drop(event_manager);
+    let resources = Arc::try_unwrap(worker_arc)
+        .expect("Block worker refs outlived event loop") // strong_count == 1 after drop(em)
+        .into_inner()
+        .expect("Poisoned lock")
+        .worker
+        .resources;
+    Some(resources)
 }
 
 fn process_control_msg(worker_arc: &Arc<Mutex<ThreadedWorker>>, response_tx: &Sender<ControlResponse>, msg: ControlMsg) -> WorkerState {
     match msg {
+        // no-op already active
+        ControlMsg::Start(_) => WorkerState::Running,
         ControlMsg::UpdateDiskImage(_path) => todo!("step 4: control plane"),
         ControlMsg::UpdateRateLimiter(bytes, ops_update) => {
             worker_arc
