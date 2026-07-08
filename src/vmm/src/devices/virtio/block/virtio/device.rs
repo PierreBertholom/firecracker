@@ -580,7 +580,6 @@ impl VirtioBlock {
     pub(crate) fn process_event(&mut self, source: u32, ops: &mut EventOps) {
         if self.is_activated() {
             match source {
-                Self::PROCESS_ACTIVATE => self.process_activate_event(ops),
                 Self::PROCESS_QUEUE | Self::PROCESS_RATE_LIMITER | Self::PROCESS_ASYNC_COMPLETION => {
                     if let BlockState::Active(ActiveBlock::Inline(ab)) = &mut self.state {
                         match source {
@@ -599,6 +598,7 @@ impl VirtioBlock {
                 source
             );
             match source {
+                Self::PROCESS_ACTIVATE => self.process_activate_event(ops),
                 Self::PROCESS_QUEUE => self.drain_queue_events(),
                 Self::PROCESS_RATE_LIMITER => {
                     self.resources_mut().rate_limiter.event_handler();

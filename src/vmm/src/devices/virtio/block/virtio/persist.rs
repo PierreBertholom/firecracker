@@ -8,7 +8,7 @@ use device::ConfigSpace;
 use serde::{Deserialize, Serialize};
 use vmm_sys_util::eventfd::EventFd;
 
-use super::device::{BlockResources, BlockState, DiskProperties};
+use super::device::{ActiveBlock, BlockResources, BlockState, DiskProperties};
 use super::*;
 use crate::devices::virtio::block::persist::BlockConstructorArgs;
 use crate::devices::virtio::block::virtio::device::FileEngineType;
@@ -72,6 +72,7 @@ impl Persist<'_> for VirtioBlock {
 
     fn save(&self) -> Self::State {
         // Save device state.
+
         VirtioBlockState {
             id: self.id.clone(),
             partuuid: self.partuuid.clone(),
