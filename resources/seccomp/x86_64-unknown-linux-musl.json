@@ -8,6 +8,10 @@
                 "comment": "Used when creating snapshots in vmm:persist::snapshot_memory_to_file through std::fs::File::metadata"
             },
             {
+                "syscall": "epoll_create1",
+                "comment": "Used by the threaded block worker's EventManager::new(), which runs on the spawned worker thread under the inherited vmm filter before it applies its own blk_worker filter"
+            },
+            {
                 "syscall": "epoll_ctl"
             },
             {
@@ -393,6 +397,28 @@
                 ]
             },
             {
+                "syscall": "mmap",
+                "comment": "Used to allocate the threaded block worker's thread stack (spawned from the VMM thread, so checked against this inherited filter)",
+                "args": [
+                    {
+                        "index": 3,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 131106,
+                        "comment": "libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_STACK"
+                    },
+                    {
+                        "index": 2,
+                        "type": "dword",
+                        "op": {
+                            "masked_eq": 4
+                        },
+                        "val": 0,
+                        "comment": "Ensure PROT_EXEC is not set"
+                    }
+                ]
+            },
+            {
                 "syscall": "memfd_create",
                 "comment": "Used by IovDeque ring buffer for net device hotplug",
                 "args": [
@@ -415,6 +441,19 @@
                         "op": "eq",
                         "val": 1033,
                         "comment": "F_ADD_SEALS"
+                    }
+                ]
+            },
+            {
+                "syscall": "fcntl",
+                "comment": "Used by EventFd::try_clone() when spawning the threaded block worker (control_evt/queue_evts duplication on the VMM thread)",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 1030,
+                        "comment": "F_DUPFD_CLOEXEC"
                     }
                 ]
             },
@@ -1503,7 +1542,42 @@
         "filter_action": "allow",
         "filter": [
             {
+                "syscall": "epoll_create1",
+                "comment": "EventManager::new() on the worker thread"
+            },
+            {
                 "syscall": "epoll_ctl"
+            },
+            {
+                "syscall": "lseek",
+                "comment": "SyncFileEngine seeks to the request offset before each read/write"
+            },
+            {
+                "syscall": "futex",
+                "comment": "Locking the Arc<Mutex<ThreadedWorker>> data path"
+            },
+            {
+                "syscall": "mmap",
+                "comment": "Allocator growth during I/O"
+            },
+            {
+                "syscall": "munmap"
+            },
+            {
+                "syscall": "mprotect"
+            },
+            {
+                "syscall": "sigaltstack"
+            },
+            {
+                "syscall": "rt_sigprocmask"
+            },
+            {
+                "syscall": "getrandom"
+            },
+            {
+                "syscall": "exit",
+                "comment": "Worker thread exit on Finish"
             },
             {
                 "syscall": "epoll_pwait"
