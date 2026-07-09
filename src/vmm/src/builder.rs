@@ -61,6 +61,7 @@ use crate::vstate::resources::ResourceAllocator;
 use crate::vstate::vcpu::VcpuError;
 use crate::vstate::vm::{KvmVm, Vm, VmError};
 use crate::{EventManager, Vmm, VmmError};
+use crate::devices::virtio::block::virtio::VirtioBlockError;
 
 /// Errors associated with starting the instance.
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
@@ -109,6 +110,8 @@ pub enum StartMicrovmError {
     NetDeviceNotConfigured,
     /// Cannot open the block device backing file: {0}
     OpenBlockDevice(io::Error),
+    /// Failed to spawn the block worker thread: {0}
+    SpawnBlockWorker(VirtioBlockError),
     /// Cannot restore microvm state: {0}
     RestoreMicrovmState(MicrovmStateError),
     /// Cannot set vm resources: {0}
@@ -675,14 +678,19 @@ fn attach_block_devices<'a, I: Iterator<Item = &'a Arc<Mutex<Block>>> + Debug>(
             }
             (locked.id().to_string(), locked.is_vhost_user())
         };
-        block.lock()
-            .expect("Poisoned lock")
-            .set_worker_filter(
-                seccomp_filters
-                    .get("blk_worker")
-                    .expect("Missing blk_worker seccomp filter")
-                    .clone()
+        {
+            let mut blk_lock = block.lock().expect("Poisoned lock");
+            blk_lock
+                .set_worker_filter(
+                    seccomp_filters
+                        .get("blk_worker")
+                        .expect("Missing blk_worker seccomp filter")
+                        .clone(),
             );
+            blk_lock
+                .spawn_worker()
+                .map_err(StartMicrovmError::SpawnBlockWorker)?
+        }
         // The device mutex mustn't be locked here otherwise it will deadlock.
         device_manager.attach_boot_virtio_device(
             vm,

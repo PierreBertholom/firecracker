@@ -69,8 +69,6 @@ pub enum ActivateError {
     RequiredFeatureNotAcked(&'static str),
     /// Vsock backend: {0}
     VsockBackend(vsock::VsockError),
-    /// Failed during thread spawn in multithreaded
-    ThreadSpawn(std::io::Error)
 }
 
 /// Trait that helps in upcasting an object to Any
