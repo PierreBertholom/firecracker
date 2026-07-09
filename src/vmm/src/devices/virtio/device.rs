@@ -17,6 +17,7 @@ use super::queue::{Queue, QueueError};
 use super::transport::VirtioInterrupt;
 use crate::MutEventSubscriber;
 use crate::devices::virtio::AsAny;
+use crate::devices::virtio::block::virtio::VirtioBlockError;
 use crate::devices::virtio::generated::virtio_ids;
 use crate::logger::{error, info, warn};
 use crate::utils::u64_to_usize;
@@ -257,7 +258,7 @@ pub trait VirtioDevice: AsAny + MutEventSubscriber + Send {
 
     /// Prepare the device for saving its state
     fn prepare_save(&mut self) {}
-    fn finalize_activation(&mut self) -> Result<(), ActivateError> { Ok(()) }
+    fn spawn_worker(&mut self) -> Result<(), VirtioBlockError> { Ok(()) }
 }
 
 impl fmt::Debug for dyn VirtioDevice {

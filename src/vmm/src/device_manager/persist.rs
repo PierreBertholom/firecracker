@@ -426,10 +426,6 @@ impl<'a> Persist<'a> for MMIODeviceManager {
                     .lock()
                     .expect("Poisoned lock")
                     .activate(mem.clone(), interrupt)?;
-                device
-                    .lock()
-                    .expect("Poisoned lock")
-                    .finalize_activation()?;
             }
 
             Ok(())

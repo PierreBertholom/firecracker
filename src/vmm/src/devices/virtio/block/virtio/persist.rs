@@ -140,7 +140,7 @@ impl Persist<'_> for VirtioBlock {
             read_only: is_read_only,
 
             threaded: state.threaded,
-            state: BlockState::Configuring(blk_resources),
+            state: BlockState::Configuring(blk_resources, None),
             metrics: BlockMetricsPerDevice::alloc(state.id.clone()),
             seccomp_filter: Arc::new(vec![]),
         })

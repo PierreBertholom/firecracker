@@ -87,8 +87,7 @@ macro_rules! unwrap_async_file_engine_or_return {
 
 impl WorkerHandle {
     pub(crate) fn spawn(
-        worker: BlockWorker,
-        seccomp_filter: Arc<BpfProgram>,
+        seccomp_filter: Arc<BpfProgram>
     ) -> Result<WorkerHandle, std::io::Error> {
         // One kick eventfd, shared between worker (registers on its epoll) and shell (writes to
         // wake it). Both refer to the same kernel object via try_clone.
