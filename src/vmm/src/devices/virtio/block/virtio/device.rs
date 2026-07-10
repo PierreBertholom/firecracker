@@ -548,7 +548,7 @@ impl VirtioBlock {
             self.register_runtime_events(ops);
         }
 
-        // TRW: threaded virtio block becomes zombie subs
+        // threaded virtio block becomes zombie sub
         if let Err(err) = ops.remove(Events::with_data(
             &self.activate_evt,
             Self::PROCESS_ACTIVATE,
@@ -569,6 +569,7 @@ impl VirtioBlock {
     pub(crate) fn process_event(&mut self, source: u32, ops: &mut EventOps) {
         if self.is_activated() {
             match source {
+                Self::PROCESS_ACTIVATE => self.process_activate_event(ops),
                 Self::PROCESS_QUEUE | Self::PROCESS_RATE_LIMITER | Self::PROCESS_ASYNC_COMPLETION => {
                     if let BlockState::Active(ActiveBlock::Inline(ab)) = &mut self.state {
                         match source {
@@ -587,7 +588,6 @@ impl VirtioBlock {
                 source
             );
             match source {
-                Self::PROCESS_ACTIVATE => self.process_activate_event(ops),
                 Self::PROCESS_QUEUE => self.drain_queue_events(),
                 Self::PROCESS_RATE_LIMITER => {
                     self.resources_mut().rate_limiter.event_handler();
@@ -723,15 +723,42 @@ impl VirtioDevice for VirtioBlock {
     fn is_activated(&self) -> bool { matches!(self.state, BlockState::Active(_)) }
 
     fn deactivate(&mut self) {
-        let res  = match std::mem::replace(&mut self.state, BlockState::Placeholder) {
-            BlockState::Active(ActiveBlock::Threaded(ab)) => ab.teardown(FlushMode::Drain),
+        let (res, handle) = match std::mem::replace(&mut self.state, BlockState::Placeholder) {
+            BlockState::Active(ActiveBlock::Threaded(ta)) => {
+                let Some(res) = ta.worker_handle.reset() else {
+                    self.state = BlockState::Active(ActiveBlock::Threaded(ta));
+                    return;
+                };
+                (res, Some(ta.worker_handle))
+            }
             BlockState::Active(ActiveBlock::Inline(mut ab)) => {
                 ab.worker.drain(true);
-                ab.worker.resources
+                let mut res = ab.worker.resources;
+                res.reset_for_reactivation();
+                (res, None)
             }
-            other => {self.state = other; return; }
+            other => {
+                self.state = other;
+                return;
+            }
         };
-        self.state = BlockState::Configuring(res, None);
+        self.state = BlockState::Configuring(res, handle);
+    }
+
+    fn reset(&mut self) -> bool {
+        self.deactivate();
+        if self.is_activated() {
+            return false;
+        }
+        self.set_acked_features(0);
+
+        if let BlockState::Configuring(res, _) = &mut self.state {
+            res.reset_for_reactivation();
+        } else {
+            return false;
+        }
+
+        true
     }
 
     fn _reset(&mut self) -> bool { true }
