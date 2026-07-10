@@ -224,6 +224,13 @@ impl VirtioDevice for Block {
         }
     }
 
+    fn reset(&mut self) -> bool {
+        match self {
+            Self::Virtio(b) => b.reset(),
+            Self::VhostUser(b) => b.reset(),
+        }
+    }
+
     fn _reset(&mut self) -> bool {
         match self {
             Self::Virtio(b) => b._reset(),

@@ -20,7 +20,7 @@ use vmm_sys_util::epoll::EventSet;
 use vmm_sys_util::eventfd::EventFd;
 use crate::devices::virtio::block::CacheType;
 use crate::devices::virtio::block::virtio::io::{async_io, FileEngine};
-use crate::devices::virtio::queue::InvalidAvailIdx;
+use crate::devices::virtio::queue::{InvalidAvailIdx, Queue};
 use crate::devices::virtio::transport::VirtioInterruptType;
 use crate::logger::{IncMetric, error, warn};
 
@@ -34,14 +34,18 @@ pub(crate) struct BlockWorker {
 
 #[derive(Debug)]
 pub(crate) struct ThreadedWorker {
-    pub(crate) worker: BlockWorker,
+    state: WorkerState,
     control_evt: EventFd,
+    control_rx: Receiver<ControlMsg>,
+    response_tx: Sender<ControlResponse>,
 }
 
+#[derive(Debug)]
 enum WorkerState {
-    Running,
-    Paused,
-    Finished,
+    Parked,
+    Running(BlockWorker),
+    Paused(BlockWorker),
+    Finished(Option<BlockResources>),
 }
 
 pub(crate) enum FlushMode {
@@ -57,12 +61,15 @@ enum ControlMsg {
     Kick,
     Pause,
     Resume,
+    Reset,
     Finish(FlushMode),
 }
 
+#[allow(clippy::large_enum_variant)]
 enum ControlResponse {
     DiskUpdated(Result<u64, VirtioBlockError>), // nsectors / error
     Paused, // ACK
+    Reset(Option<BlockResources>),
 }
 
 #[derive(Debug)]
@@ -101,7 +108,7 @@ impl WorkerHandle {
             .name("fc_blk_worker".to_owned())
             .spawn(move || {
                 // epoll first (not in seccomp), then register, then lock down.
-                let mut event_manager = EventManager::new()
+                let event_manager = EventManager::new()
                     .expect("Failed to create block worker EventManager");
 
                 if let Err(err) = apply_filter(&seccomp_filter) {
@@ -143,6 +150,34 @@ impl WorkerHandle {
         })
     }
 
+    pub(crate) fn reset(&self) -> Option<BlockResources> {
+        if let Err(e) = self.control_tx.send(ControlMsg::Reset) {
+            error!("Block receiver already dropped on reset: {:?}", e);
+            return None;
+        }
+
+        if let Err(e) = self.control_evt.write(1) {
+            error!("Block control event is closed on reset: {:?}", e);
+            return None;
+        }
+
+        loop {
+            match self.receiver_rx.recv() {
+                Ok(ControlResponse::Reset(resources)) => return resources,
+                Ok(ControlResponse::DiskUpdated(_)) => {
+                    warn!("Ignoring disk update response while waiting for reset");
+                }
+                Ok(ControlResponse::Paused) => {
+                    warn!("Ignoring pause response while waiting for reset");
+                }
+                Err(e) => {
+                    error!("Block worker failed to acknowledge reset: {:?}", e);
+                    return None;
+                }
+            }
+        }
+    }
+
     pub(crate) fn kick(&self) {
         if let Err(e) = self.control_tx.send(ControlMsg::Kick) {
             error!("Block receiver dropped on kick: {:?}", e);
@@ -150,6 +185,15 @@ impl WorkerHandle {
 
         if let Err(e) = self.control_evt.write(1) {
             error!("Block control event is closed on kick: {:?}", e);
+        }
+    }
+}
+
+impl BlockResources {
+    pub(crate) fn reset_for_reactivation(&mut self) {
+        self.is_io_engine_throttled = false;
+        for queue in self.queues.iter_mut() {
+            *queue = Queue::new(queue.max_size);
         }
     }
 }
@@ -378,30 +422,7 @@ impl ThreadedWorker {
     const PROCESS_ASYNC_COMPLETION: u32 = 2;
     const PROCESS_CONTROL: u32 = 3;
 
-    fn register_runtime_events(&self, ops: &mut EventOps) {
-        if let Err(err) = ops.add(Events::with_data(
-            &self.worker.resources.queue_evts[0],
-            Self::PROCESS_QUEUE,
-            EventSet::IN,
-        )) {
-            error!("Failed to register queue event: {}", err);
-        }
-        if let Err(err) = ops.add(Events::with_data(
-            &self.worker.resources.rate_limiter,
-            Self::PROCESS_RATE_LIMITER,
-            EventSet::IN,
-        )) {
-            error!("Failed to register ratelimiter event: {}", err);
-        }
-        if let FileEngine::Async(ref engine) = self.worker.resources.disk.file_engine
-            && let Err(err) = ops.add(Events::with_data(
-            engine.completion_evt(),
-            Self::PROCESS_ASYNC_COMPLETION,
-            EventSet::IN,
-        ))
-        {
-            error!("Failed to register IO engine completion event: {}", err);
-        }
+    fn register_control_event(&self, ops: &mut EventOps) {
         if let Err(err) = ops.add(Events::with_data(
             &self.control_evt,
             Self::PROCESS_CONTROL,
@@ -411,115 +432,255 @@ impl ThreadedWorker {
         }
     }
 
-    fn process_control_event(&mut self) {
+    fn register_runtime_events(resources: &BlockResources, ops: &mut EventOps) {
+        if let Err(err) = ops.add(Events::with_data(
+            &resources.queue_evts[0],
+            Self::PROCESS_QUEUE,
+            EventSet::IN,
+        )) {
+            error!("Failed to register queue event: {}", err);
+        }
+        if let Err(err) = ops.add(Events::with_data(
+            &resources.rate_limiter,
+            Self::PROCESS_RATE_LIMITER,
+            EventSet::IN,
+        )) {
+            error!("Failed to register ratelimiter event: {}", err);
+        }
+        if let FileEngine::Async(ref engine) = resources.disk.file_engine
+            && let Err(err) = ops.add(Events::with_data(
+                engine.completion_evt(),
+                Self::PROCESS_ASYNC_COMPLETION,
+                EventSet::IN,
+            ))
+        {
+            error!("Failed to register IO engine completion event: {}", err);
+        }
+    }
+
+    fn unregister_runtime_events(resources: &BlockResources, ops: &mut EventOps) {
+        if let Err(err) = ops.remove(Events::with_data(
+            &resources.queue_evts[0],
+            Self::PROCESS_QUEUE,
+            EventSet::IN,
+        )) {
+            error!("Failed to unregister queue event: {}", err);
+        }
+        if let Err(err) = ops.remove(Events::with_data(
+            &resources.rate_limiter,
+            Self::PROCESS_RATE_LIMITER,
+            EventSet::IN,
+        )) {
+            error!("Failed to unregister ratelimiter event: {}", err);
+        }
+        if let FileEngine::Async(ref engine) = resources.disk.file_engine
+            && let Err(err) = ops.remove(Events::with_data(
+                engine.completion_evt(),
+                Self::PROCESS_ASYNC_COMPLETION,
+                EventSet::IN,
+            ))
+        {
+            error!("Failed to unregister IO engine completion event: {}", err);
+        }
+    }
+
+    fn process_control_event(&mut self, ops: &mut EventOps) {
         if let Err(err) = self.control_evt.read() {
             error!("Failed to get control event: {:?}", err);
-            self.worker.metrics.event_fails.inc();
+            if let Some(worker) = self.worker_mut() {
+                worker.metrics.event_fails.inc();
+            }
+            return;
         }
+
+        while let Ok(msg) = self.control_rx.try_recv() {
+            self.process_control_msg(ops, msg);
+            if self.is_finished() {
+                break;
+            }
+        }
+    }
+
+    fn process_control_msg(&mut self, ops: &mut EventOps, msg: ControlMsg) {
+        match msg {
+            ControlMsg::Start(worker) => self.start_worker(worker, ops),
+            ControlMsg::UpdateDiskImage(_path) => todo!("step 4: control plane"),
+            ControlMsg::UpdateRateLimiter(bytes, ops_update) => {
+                if let Some(worker) = self.worker_mut() {
+                    worker.update_rate_limiter(bytes, ops_update);
+                } else {
+                    warn!("Rate limiter update requested while block worker is parked");
+                }
+            }
+            ControlMsg::Pause => self.pause_worker(ops),
+            ControlMsg::Resume => self.resume_worker(ops),
+            ControlMsg::Reset => self.reset_worker(ops),
+            ControlMsg::Kick => {
+                // process directly instead of going through epoll (regular kick)
+                if let WorkerState::Running(worker) = &mut self.state {
+                    worker
+                        .process_virtio_queues()
+                        .unwrap_or_else(|e| error!("Kick queue processing failed: {:?}", e));
+                }
+            }
+            ControlMsg::Finish(flush_mode) => self.finish_worker(flush_mode, ops),
+        }
+    }
+
+    fn start_worker(&mut self, worker: BlockWorker, ops: &mut EventOps) {
+        if !matches!(self.state, WorkerState::Parked) {
+            warn!("Start requested while block worker is not parked");
+            return;
+        }
+
+        Self::register_runtime_events(&worker.resources, ops);
+        self.state = WorkerState::Running(worker);
+    }
+
+    fn pause_worker(&mut self, ops: &mut EventOps) {
+        match std::mem::replace(&mut self.state, WorkerState::Parked) {
+            WorkerState::Running(mut worker) => {
+                Self::unregister_runtime_events(&worker.resources, ops);
+                worker.prepare_save();
+                if let Err(err) = self.response_tx.send(ControlResponse::Paused)
+                { error!("Failed to send Paused ACK: {:?}", err); }
+                self.state = WorkerState::Paused(worker);
+            }
+            WorkerState::Paused(worker) => {
+                if let Err(err) = self.response_tx.send(ControlResponse::Paused)
+                { error!("Failed to send Paused ACK: {:?}", err); }
+                self.state = WorkerState::Paused(worker);
+            }
+            other => {
+                warn!("Pause requested while block worker is not running");
+                self.state = other;
+            }
+        }
+    }
+
+    fn resume_worker(&mut self, ops: &mut EventOps) {
+        match std::mem::replace(&mut self.state, WorkerState::Parked) {
+            WorkerState::Paused(worker) => {
+                Self::register_runtime_events(&worker.resources, ops);
+                self.state = WorkerState::Running(worker);
+            }
+            other => {
+                warn!("Resume requested while block worker is not paused");
+                self.state = other;
+            }
+        }
+    }
+
+    fn reset_worker(&mut self, ops: &mut EventOps) {
+        match std::mem::replace(&mut self.state, WorkerState::Parked) {
+            WorkerState::Running(mut worker) => {
+                Self::unregister_runtime_events(&worker.resources, ops);
+                worker.drain(true);
+                worker.resources.reset_for_reactivation();
+                if let Err(err) = self
+                    .response_tx
+                    .send(ControlResponse::Reset(Some(worker.resources)))
+                { error!("Failed to send Reset ACK: {:?}", err); }
+            }
+            WorkerState::Paused(mut worker) => {
+                worker.drain(true);
+                worker.resources.reset_for_reactivation();
+                if let Err(err) = self
+                    .response_tx
+                    .send(ControlResponse::Reset(Some(worker.resources)))
+                { error!("Failed to send Reset ACK: {:?}", err); }
+            }
+            WorkerState::Parked => {
+                warn!("Reset requested while block worker is parked");
+                if let Err(err) = self.response_tx.send(ControlResponse::Reset(None))
+                { error!("Failed to send Reset ACK: {:?}", err); }
+            }
+            WorkerState::Finished(resources) => {
+                self.state = WorkerState::Finished(resources);
+            }
+        }
+    }
+
+    fn finish_worker(&mut self, flush_mode: FlushMode, ops: &mut EventOps) {
+        match std::mem::replace(&mut self.state, WorkerState::Parked) {
+            WorkerState::Running(mut worker) => {
+                Self::unregister_runtime_events(&worker.resources, ops);
+                Self::flush_worker(&mut worker, flush_mode);
+                self.state = WorkerState::Finished(Some(worker.resources));
+            }
+            WorkerState::Paused(mut worker) => {
+                Self::flush_worker(&mut worker, flush_mode);
+                self.state = WorkerState::Finished(Some(worker.resources));
+            }
+            WorkerState::Parked => {
+                self.state = WorkerState::Finished(None);
+            }
+            WorkerState::Finished(resources) => {
+                self.state = WorkerState::Finished(resources);
+            }
+        }
+    }
+
+    fn flush_worker(worker: &mut BlockWorker, flush_mode: FlushMode) {
+        match flush_mode {
+            FlushMode::Drain => worker.drain(true),
+            FlushMode::DrainAndFlush => worker.drain_and_flush(true),
+        }
+        worker.resources.is_io_engine_throttled = false;
+    }
+
+    fn worker_mut(&mut self) -> Option<&mut BlockWorker> {
+        match &mut self.state {
+            WorkerState::Running(worker) | WorkerState::Paused(worker) => Some(worker),
+            WorkerState::Parked | WorkerState::Finished(_) => None,
+        }
+    }
+
+    fn is_finished(&self) -> bool {
+        matches!(self.state, WorkerState::Finished(_))
     }
 }
 
-fn run_worker_loop(mut event_manager: EventManager, control_evt: EventFd, control_rx: Receiver<ControlMsg>, response_tx: Sender<ControlResponse>) -> Option<BlockResources> {
-    // pre-activation - parked waiting on Start msg. Resources still live shell-side, so a
-    // Finish (or a dropped channel) here hands nothing back
-    let worker = loop {
-        match control_rx.recv() {
-            Ok(ControlMsg::Start(w)) => break w,
-            Ok(ControlMsg::Finish(_)) => return None,
-            Ok(_) => {warn!("Control message before device activation, ignoring");},
-            Err(_) => return None,
-        }
-    };
-
-    // post-activation - active
-    let worker_arc = Arc::new(Mutex::new(ThreadedWorker { worker, control_evt }));
-    let loop_arc = Arc::clone(&worker_arc);
-    event_manager.add_subscriber(loop_arc);
-
-    let mut state = WorkerState::Running;
+fn run_worker_loop(
+    mut event_manager: EventManager,
+    control_evt: EventFd,
+    control_rx: Receiver<ControlMsg>,
+    response_tx: Sender<ControlResponse>,
+) -> Option<BlockResources> {
+    let worker = Arc::new(Mutex::new(ThreadedWorker {
+        state: WorkerState::Parked,
+        control_evt,
+        control_rx,
+        response_tx,
+    }));
+    let subscriber: Arc<Mutex<dyn MutEventSubscriber>> = worker.clone();
+    event_manager.add_subscriber(subscriber);
 
     loop {
-        match state {
-            WorkerState::Running => {
-                if let Err(err) = event_manager.run() {
-                    error!("Block worker event loop error: {:?}", err);
-                }
-                while let Ok(msg) = control_rx.try_recv() {
-                    state = process_control_msg(&worker_arc, &response_tx, msg);
-                    if !matches!(state, WorkerState::Running) {
-                        break;
-                    }
-                }
-            }
-            // block on recv waiting for Resume/Finish message
-            WorkerState::Paused => match control_rx.recv() {
-                Ok(msg) => state = process_control_msg(&worker_arc, &response_tx, msg),
-                Err(_) => state = WorkerState::Finished,
-            },
-            WorkerState::Finished => break,
+        if let Err(err) = event_manager.run() {
+            error!("Block worker event loop error: {:?}", err);
+        }
+        if worker.lock().expect("Poisoned block worker lock").is_finished() {
+            break;
         }
     }
 
-    // Finished state - teardown. Drop the EventManager FIRST to release the subscriber clone
-    // it holds, so `worker_arc` reaches strong_count == 1 and `try_unwrap` succeeds.
+    // drop the EventManager FIRST to release the subscriber clone
+    // it holds, so worker_arc reaches strong_count == 1 and try_unwrap succeeds.
     drop(event_manager);
-    let resources = Arc::try_unwrap(worker_arc)
-        .expect("Block worker refs outlived event loop") // strong_count == 1 after drop(em)
+    match Arc::try_unwrap(worker)
+        .expect("Block worker refs outlived event loop")
         .into_inner()
         .expect("Poisoned lock")
-        .worker
-        .resources;
-    Some(resources)
-}
-
-fn process_control_msg(worker_arc: &Arc<Mutex<ThreadedWorker>>, response_tx: &Sender<ControlResponse>, msg: ControlMsg) -> WorkerState {
-    match msg {
-        // no-op already active
-        ControlMsg::Start(_) => WorkerState::Running,
-        ControlMsg::UpdateDiskImage(_path) => todo!("step 4: control plane"),
-        ControlMsg::UpdateRateLimiter(bytes, ops_update) => {
-            worker_arc
-                .lock()
-                .expect("Poisoned block worker lock")
-                .worker
-                .update_rate_limiter(bytes, ops_update);
-            WorkerState::Running
-        }
-        ControlMsg::Pause => {
-            worker_arc
-                .lock()
-                .expect("Poisoned block worker lock")
-                .worker
-                .prepare_save();
-            if let Err(err) = response_tx.send(ControlResponse::Paused) {
-                error!("Failed to send Paused ACK: {:?}", err);
-            }
-            WorkerState::Paused
-        }
-        ControlMsg::Resume => WorkerState::Running,
-        ControlMsg::Kick => {
-            worker_arc.lock()
-                .expect("Poisoned block worker lock")
-                .worker
-                // process directly instead of going through epoll (regular kick)
-                .process_virtio_queues()
-                .unwrap_or_else(|e| error!("Kick queue processing failed: {:?}",e));
-            WorkerState::Running
-        },
-        ControlMsg::Finish(flush_mode) => {
-            let w = &mut worker_arc.lock().expect("Poisoned block worker lock").worker;
-            match flush_mode {
-                FlushMode::Drain => w.drain(true),
-                FlushMode::DrainAndFlush => w.drain_and_flush(true),
-            }
-            w.resources.is_io_engine_throttled = false;
-            WorkerState::Finished
-        },
+        .state
+    {
+        WorkerState::Finished(resources) => resources,
+        _ => unreachable!("block worker exited without Finished state"),
     }
 }
 
 impl MutEventSubscriber for ThreadedWorker {
-    fn process(&mut self, event: Events, _ops: &mut EventOps) {
+    fn process(&mut self, event: Events, ops: &mut EventOps) {
         let source = event.data();
         let event_set = event.event_set();
 
@@ -534,16 +695,24 @@ impl MutEventSubscriber for ThreadedWorker {
             return;
         }
 
-        match source {
-            Self::PROCESS_QUEUE => self.worker.process_queue_event(),
-            Self::PROCESS_RATE_LIMITER => self.worker.process_rate_limiter_event(),
-            Self::PROCESS_ASYNC_COMPLETION => self.worker.process_async_completion_event(),
-            Self::PROCESS_CONTROL => self.process_control_event(),
-            _ => warn!("Block: Spurious event received: {:?}", source),
+        if let WorkerState::Running(worker) = &mut self.state {
+            match source {
+                Self::PROCESS_QUEUE => worker.process_queue_event(),
+                Self::PROCESS_RATE_LIMITER => worker.process_rate_limiter_event(),
+                Self::PROCESS_ASYNC_COMPLETION => worker.process_async_completion_event(),
+                Self::PROCESS_CONTROL => self.process_control_event(ops),
+                _ => warn!("Block: Spurious event received: {:?}", source),
+            }
+        } else {
+            match source {
+                Self::PROCESS_CONTROL => self.process_control_event(ops),
+                _ => warn!("Block: The device worker is not yet activated. Spurious event received: {:?}",source),
+            }
         }
+
     }
 
     fn init(&mut self, ops: &mut EventOps) {
-        self.register_runtime_events(ops);
+        self.register_control_event(ops);
     }
 }
