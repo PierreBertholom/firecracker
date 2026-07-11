@@ -66,4 +66,6 @@ pub enum VirtioBlockError {
     Persist(crate::devices::virtio::persist::PersistError),
     /// Thread spawn error: {0}
     ThreadSpawn(std::io::Error),
+    /// Worker control-plane error: {0}
+    WorkerControl(String),
 }

@@ -1513,6 +1513,30 @@
                         "val": 0
                     }
                 ]
+            },
+            {
+                "syscall": "fcntl",
+                "comment": "Used by snapshotting, drive patching and rescanning",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 2,
+                        "comment": "FCNTL_F_SETFD"
+                    },
+                    {
+                        "index": 2,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 1,
+                        "comment": "FCNTL_FD_CLOEXEC"
+                    }
+                ]
+            },
+            {
+                "syscall": "fstat",
+                "comment": "Used by disk update"
             }
         ]
     }

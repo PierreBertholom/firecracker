@@ -56,7 +56,7 @@ pub(crate) enum FlushMode {
 #[allow(clippy::large_enum_variant)]
 enum ControlMsg {
     Start(BlockWorker),
-    UpdateDiskImage(String),
+    UpdateDiskImage(String, bool),
     UpdateRateLimiter(BucketUpdate, BucketUpdate),
     Kick,
     Pause,
@@ -173,6 +173,40 @@ impl WorkerHandle {
                 Err(e) => {
                     error!("Block worker failed to acknowledge reset: {:?}", e);
                     return None;
+                }
+            }
+        }
+    }
+
+    pub(crate) fn update_disk_image(&self, disk_image_path: String, read_only: bool) -> Result<u64, VirtioBlockError> {
+        if let Err(e) = self.control_tx.send(ControlMsg::UpdateDiskImage(disk_image_path, read_only)) {
+            error!("Failed to send disk update message: {:?}", e);
+            return Err(VirtioBlockError::WorkerControl(format!(
+                "failed to send disk update request: {e}"
+            )));
+        }
+
+        if let Err(e) = self.control_evt.write(1) {
+            error!("Block control event is closed on disk update: {:?}", e);
+            return Err(VirtioBlockError::WorkerControl(format!(
+                "failed to notify block worker for disk update: {e}"
+            )));
+        }
+
+        loop {
+            match self.receiver_rx.recv() {
+                Ok(ControlResponse::DiskUpdated(result)) => return result,
+                Ok(ControlResponse::Reset(_)) => {
+                    warn!("Ignoring reset response while waiting for disk update");
+                }
+                Ok(ControlResponse::Paused) => {
+                    warn!("Ignoring pause response while waiting for disk update");
+                }
+                Err(e) => {
+                    error!("Block worker failed to acknowledge disk update: {:?}", e);
+                    return Err(VirtioBlockError::WorkerControl(format!(
+                        "failed to receive disk update response: {e}"
+                    )));
                 }
             }
         }
@@ -392,23 +426,12 @@ impl BlockWorker {
             self.process_async_completion_queue();
         }
     }
-    /*
-    /// Update the backing file and the config space of the block device.
-    pub fn update_disk_image(&mut self, disk_image_path: String) -> Result<(), VirtioBlockError> {
-        let read_only = self.read_only;
-        self.resources_mut().disk.update(disk_image_path, read_only)?; // TRW: use channel instead
-        self.config_space.capacity = self.disk().nsectors.to_le(); // virtio_block_config_space();
 
-        // Kick the driver to pick up the changes. (But only if the device is already activated).
-        if self.is_activated() {
-            self.interrupt_trigger()
-                .trigger(VirtioInterruptType::Config)
-                .unwrap();
-        }
-
-        self.metrics.update_count.inc();
-        Ok(())
-    }*/
+    /// Update the backing file and return the new sector count.
+    pub fn update_disk_image(&mut self, disk_image_path: String, read_only: bool) -> Result<u64, VirtioBlockError> {
+        self.resources.disk.update(disk_image_path, read_only)?;
+        Ok(self.resources.disk.nsectors)
+    }
 
     /// Updates the parameters for the rate limiter
     pub fn update_rate_limiter(&mut self, bytes: BucketUpdate, ops: BucketUpdate) {
@@ -504,7 +527,20 @@ impl ThreadedWorker {
     fn process_control_msg(&mut self, ops: &mut EventOps, msg: ControlMsg) {
         match msg {
             ControlMsg::Start(worker) => self.start_worker(worker, ops),
-            ControlMsg::UpdateDiskImage(_path) => todo!("step 4: control plane"),
+            ControlMsg::UpdateDiskImage(path, read_only) => {
+                let result = if let Some(worker) = self.worker_mut() {
+                    worker.update_disk_image(path, read_only)
+                } else {
+                    warn!("Disk image update requested while block worker is parked");
+                    Err(VirtioBlockError::WorkerControl(
+                        "disk image update requested while block worker is not running".to_string(),
+                    ))
+                };
+
+                if let Err(err) = self.response_tx.send(ControlResponse::DiskUpdated(result)) {
+                    error!("Failed to send DiskUpdated ACK: {:?}", err);
+                }
+            }
             ControlMsg::UpdateRateLimiter(bytes, ops_update) => {
                 if let Some(worker) = self.worker_mut() {
                     worker.update_rate_limiter(bytes, ops_update);
