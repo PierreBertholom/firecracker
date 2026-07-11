@@ -318,6 +318,7 @@ pub(crate) struct InlineActive {
 #[derive(Debug)]
 pub(crate) struct ThreadedActive {
     worker_handle: WorkerHandle,
+    interrupt: Arc<dyn VirtioInterrupt>,
     queue_cfg: Vec<QueueConfig>,
 }
 
@@ -450,8 +451,22 @@ impl VirtioBlock {
     /// Update the backing file and the config space of the block device.
     pub fn update_disk_image(&mut self, disk_image_path: String) -> Result<(), VirtioBlockError> {
         let read_only = self.read_only;
-        self.resources_mut().disk.update(disk_image_path, read_only)?; // TRW: use channel instead
-        self.config_space.capacity = self.disk().nsectors.to_le(); // virtio_block_config_space();
+        let nsectors = match &mut self.state {
+            BlockState::Configuring(res, _) => {
+                res.disk.update(disk_image_path, read_only)?;
+                res.disk.nsectors
+            }
+            BlockState::Active(ActiveBlock::Inline(ab)) => {
+                ab.worker.update_disk_image(disk_image_path, read_only)?
+            }
+            BlockState::Active(ActiveBlock::Threaded(ab)) => {
+                ab.worker_handle
+                    .update_disk_image(disk_image_path, read_only)?
+            }
+            BlockState::Placeholder => unreachable!("not a runtime state"),
+        };
+
+        self.config_space.capacity = nsectors.to_le();
 
         // Kick the driver to pick up the changes. (But only if the device is already activated).
         if self.is_activated() {
@@ -638,6 +653,7 @@ impl VirtioDevice for VirtioBlock {
     fn interrupt_trigger(&self) -> &dyn VirtioInterrupt {
         match &self.state {
             BlockState::Active(ActiveBlock::Inline(ab)) => ab.worker.active_state.interrupt.deref(),
+            BlockState::Active(ActiveBlock::Threaded(ab)) => ab.interrupt.deref(),
             _ => panic!("Device not initialized"),
         }
     }
@@ -700,14 +716,14 @@ impl VirtioDevice for VirtioBlock {
 
         let worker = BlockWorker {
             resources: res,
-            active_state: ActiveState { mem, interrupt },
+            active_state: ActiveState { mem, interrupt: interrupt.clone(), },
             metrics: self.metrics.clone(),
         };
 
         if self.threaded {
             let worker_handle = handle.expect("Worker thread must be spawned before activation");
             worker_handle.start(worker);
-            self.state = BlockState::Active(ActiveBlock::Threaded(ThreadedActive { worker_handle, queue_cfg }));
+            self.state = BlockState::Active(ActiveBlock::Threaded(ThreadedActive { worker_handle, interrupt, queue_cfg, }));
         } else {
             self.state = BlockState::Active(ActiveBlock::Inline(InlineActive { worker, queue_cfg }));
         }
@@ -1980,5 +1996,40 @@ mod tests {
             );
             assert_eq!(block.disk().image_id, id.as_slice());
         }
+    }
+
+    #[test]
+    fn test_update_disk_image_threaded() {
+        let mut block = default_block(FileEngineType::Sync);
+        block.threaded = true;
+        block.spawn_worker().unwrap();
+
+        let mem = default_mem();
+        let interrupt = default_interrupt();
+        let vq = VirtQueue::new(GuestAddress(0), &mem, 16);
+        set_queue(&mut block, 0, vq.create_queue());
+        block.activate(mem, interrupt).unwrap();
+
+        let f = TempFile::new().unwrap();
+        f.as_file().set_len(u64::from(SECTOR_SIZE) * 3).unwrap();
+        let path = f.as_path();
+        let mdata = metadata(path).unwrap();
+
+        block
+            .update_disk_image(String::from(path.to_str().unwrap()))
+            .unwrap();
+
+        assert_eq!(u64::from_le(block.config_space.capacity), 3);
+        assert!(
+            block
+                .interrupt_trigger()
+                .has_pending_interrupt(VirtioInterruptType::Config)
+        );
+
+        block.deactivate();
+        assert_eq!(
+            block.disk().file_engine.file().metadata().unwrap().st_ino(),
+            mdata.st_ino()
+        );
     }
 }
