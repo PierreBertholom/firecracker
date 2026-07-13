@@ -221,6 +221,16 @@ impl WorkerHandle {
             error!("Block control event is closed on kick: {:?}", e);
         }
     }
+
+    pub(crate) fn update_rate_limiter(&self, bytes: BucketUpdate, ops_update: BucketUpdate) {
+        if let Err(e) = self.control_tx.send(ControlMsg::UpdateRateLimiter(bytes, ops_update)) {
+            error!("Block receiver dropped on rate limiter update: {:?}", e);
+        }
+
+        if let Err(e) = self.control_evt.write(1) {
+            error!("Block control event is closed on rate limiter update: {:?}", e);
+        }
+    }
 }
 
 impl BlockResources {

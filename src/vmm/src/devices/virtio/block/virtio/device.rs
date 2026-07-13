@@ -481,7 +481,12 @@ impl VirtioBlock {
 
     /// Updates the parameters for the rate limiter
     pub fn update_rate_limiter(&mut self, bytes: BucketUpdate, ops: BucketUpdate) {
-        self.resources_mut().rate_limiter.update_buckets(bytes, ops); // TRW: use channel instead
+        match &mut self.state {
+            BlockState::Configuring(res, _) => res.rate_limiter.update_buckets(bytes, ops),
+            BlockState::Active(ActiveBlock::Threaded(ab)) => ab.worker_handle.update_rate_limiter(bytes, ops),
+            BlockState::Active(ActiveBlock::Inline(ab)) => ab.worker.update_rate_limiter(bytes, ops),
+            _ => unreachable!("not a runtime state"),
+        }
     }
 
     pub(crate) fn process_virtio_queues(&mut self) -> Result<(), InvalidAvailIdx> {
