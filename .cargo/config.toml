@@ -1,5 +1,4 @@
 [build]
-target = "aarch64-unknown-linux-musl"
 target-dir = "build/cargo_target"
 rustflags = [
   "-Ccodegen-units=1",

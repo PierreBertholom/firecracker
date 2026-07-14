@@ -1602,6 +1602,14 @@
                 "comment": "Used for submitting io_uring requests"
             },
             {
+                "syscall": "io_uring_setup",
+                "comment": "Rebuilding the io_uring ring on the worker thread during drive patch (update_file)"
+            },
+            {
+                "syscall": "io_uring_register",
+                "comment": "Registering fixed fds/opcode restrictions when rebuilding the ring on drive patch"
+            },
+            {
                 "syscall": "brk",
                 "comment": "Called for expanding the heap"
             },
