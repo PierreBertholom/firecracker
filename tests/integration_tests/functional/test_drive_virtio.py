@@ -292,7 +292,7 @@ def test_patch_drive(uvm, io_engine, threaded):
     assert lines[1].strip() == size_bytes_str
 
 
-def test_no_flush(uvm, io_engine):
+def test_no_flush(uvm, io_engine, threaded):
     """
     Verify default block ignores flush.
     """
@@ -308,6 +308,7 @@ def test_no_flush(uvm, io_engine):
         test_microvm.rootfs_file,
         is_root_device=True,
         io_engine=io_engine,
+        threaded=threaded,
     )
     test_microvm.start()
 
@@ -328,7 +329,7 @@ def test_no_flush(uvm, io_engine):
 
 @pin_guest_kernel(GUEST_KERNEL_DEFAULT)
 @pin_rootfs_mode("rw")
-def test_flush(uvm, io_engine):
+def test_flush(uvm, io_engine, threaded):
     """
     Verify block with flush actually flushes.
     """
@@ -344,6 +345,7 @@ def test_flush(uvm, io_engine):
         is_root_device=True,
         cache_type="Writeback",
         io_engine=io_engine,
+        threaded=threaded,
     )
     test_microvm.start()
 

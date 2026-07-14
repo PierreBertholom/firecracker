@@ -118,7 +118,7 @@ impl WorkerHandle {
         // wake it). Both refer to the same kernel object via try_clone.
         let control_evt = EventFd::new(libc::EFD_NONBLOCK)?;
         let handle_evt = control_evt.try_clone()?;
-        
+
         let (control_tx, control_rx) = channel::<ControlMsg>();
         let (response_tx, receiver_rx) = channel::<ControlResponse>();
 
