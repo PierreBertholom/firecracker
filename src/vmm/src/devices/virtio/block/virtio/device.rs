@@ -35,7 +35,7 @@ use crate::devices::virtio::generated::virtio_blk::{
 };
 use crate::devices::virtio::generated::virtio_config::VIRTIO_F_VERSION_1;
 use crate::devices::virtio::generated::virtio_ring::VIRTIO_RING_F_EVENT_IDX;
-use crate::devices::virtio::queue::{InvalidAvailIdx, Queue};
+use crate::devices::virtio::queue::{InvalidAvailIdx, Queue, QueueError};
 use crate::devices::virtio::transport::{VirtioInterrupt, VirtioInterruptType};
 use crate::impl_device_type;
 use crate::logger::{IncMetric, error, warn};
@@ -317,7 +317,7 @@ pub(crate) struct InlineActive {
 /// Multi-threaded mode
 #[derive(Debug)]
 pub(crate) struct ThreadedActive {
-    worker_handle: WorkerHandle,
+    pub(crate) worker_handle: WorkerHandle,
     interrupt: Arc<dyn VirtioInterrupt>,
     queue_cfg: Vec<QueueConfig>,
 }
@@ -518,8 +518,10 @@ impl VirtioBlock {
 
     /// Single thread path prepare save redirecting work to BlockWorker
     pub fn prepare_save(&mut self) {
-        if let BlockState::Active(ActiveBlock::Inline(ab)) = &mut self.state {
-            ab.worker.prepare_save()
+        match &mut self.state {
+            BlockState::Active(ActiveBlock::Inline(ab)) =>ab.worker.prepare_save(),
+            BlockState::Active(ActiveBlock::Threaded(ta)) => ta.worker_handle.pause(),
+            _ => {},
         }
     }
 
@@ -582,7 +584,10 @@ impl VirtioBlock {
 
     pub(crate) fn init_events(&mut self, ops: &mut EventOps) {
         if self.is_activated() {
-            self.register_runtime_events(ops);
+            // hit on restore where the device is already active at sub time
+            if !self.threaded {
+                self.register_runtime_events(ops);
+            }
         } else {
             self.register_activate_event(ops);
         }
@@ -653,14 +658,19 @@ impl VirtioDevice for VirtioBlock {
         &mut self.resources_mut().queues
     }
 
-    fn queue_events(&self) -> &[EventFd] { // TRW: ensure unreachable when active
-        &self.resources().queue_evts
+    fn queue_events(&self) -> &[EventFd] { // reached at hot-unplug on active state
+        match &self.state {
+            BlockState::Configuring(res, _) => &res.queue_evts,
+            BlockState::Active(ActiveBlock::Inline(ab)) => &ab.worker.resources.queue_evts,
+            BlockState::Active(ActiveBlock::Threaded(ta)) => ta.worker_handle.queue_events(),
+            BlockState::Placeholder => unreachable!("not a runtime state"),
+        }
     }
 
     fn interrupt_trigger(&self) -> &dyn VirtioInterrupt {
         match &self.state {
             BlockState::Active(ActiveBlock::Inline(ab)) => ab.worker.active_state.interrupt.deref(),
-            BlockState::Active(ActiveBlock::Threaded(ab)) => ab.interrupt.deref(),
+            BlockState::Active(ActiveBlock::Threaded(ta)) => ta.interrupt.deref(),
             _ => panic!("Device not initialized"),
         }
     }
@@ -725,7 +735,7 @@ impl VirtioDevice for VirtioBlock {
         if self.threaded {
             let worker_handle = handle.expect("Worker thread must be spawned before activation");
             worker_handle.start(worker);
-            self.state = BlockState::Active(ActiveBlock::Threaded(ThreadedActive { worker_handle, interrupt, queue_cfg, }));
+            self.state = BlockState::Active(ActiveBlock::Threaded(ThreadedActive { worker_handle, interrupt, queue_cfg }));
         } else {
             self.state = BlockState::Active(ActiveBlock::Inline(InlineActive { worker, queue_cfg }));
         }
@@ -738,7 +748,7 @@ impl VirtioDevice for VirtioBlock {
         Ok(())
     }
 
-    fn is_activated(&self) -> bool { matches!(self.state, BlockState::Active(_)) }
+    fn is_activated(&self) -> bool { matches!(&self.state, BlockState::Active(_)) }
 
     fn deactivate(&mut self) {
         let (res, handle) = match std::mem::replace(&mut self.state, BlockState::Placeholder) {
@@ -789,12 +799,34 @@ impl VirtioDevice for VirtioBlock {
         }
     }
 
+    fn mark_queue_memory_dirty(&mut self, mem: &GuestMemoryMmap) -> Result<(), QueueError> {
+        match &mut self.state {
+            BlockState::Active(ActiveBlock::Threaded(ta)) => ta.worker_handle.mark_queue_memory_dirty(mem),
+            BlockState::Active(ActiveBlock::Inline(ab)) => {
+                for queue in ab.worker.resources.queues.clone().iter_mut() {
+                    queue.initialize(mem)?
+                }
+                Ok(())
+            },
+            _ => Ok(())
+        }
+    }
+
     fn spawn_worker(&mut self) -> Result<(), VirtioBlockError>{
         if !self.threaded {
             return Ok(());
         }
-        if let BlockState::Configuring(_, handle @ None) = &mut self.state {
-            let worker = WorkerHandle::spawn(self.seccomp_filter.clone()).map_err(VirtioBlockError::ThreadSpawn)?;
+        if let BlockState::Configuring(res, handle @ None) = &mut self.state {
+            let queue_evts = res
+                .queue_evts
+                .iter()
+                .map(EventFd::try_clone)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(VirtioBlockError::EventFd)?;
+
+            let worker = WorkerHandle::spawn(self.seccomp_filter.clone(), queue_evts)
+                .map_err(VirtioBlockError::ThreadSpawn)?;
+
             *handle = Some(worker);
         }
         Ok(())

@@ -13,6 +13,7 @@ use super::*;
 use crate::devices::virtio::block::persist::BlockConstructorArgs;
 use crate::devices::virtio::block::virtio::device::FileEngineType;
 use crate::devices::virtio::block::virtio::metrics::BlockMetricsPerDevice;
+use crate::devices::virtio::block::virtio::test_utils::rate_limiter;
 use crate::devices::virtio::device::VirtioDeviceType;
 use crate::devices::virtio::generated::virtio_blk::VIRTIO_BLK_F_RO;
 use crate::devices::virtio::persist::VirtioDeviceState;
@@ -72,16 +73,39 @@ impl Persist<'_> for VirtioBlock {
 
     fn save(&self) -> Self::State {
         // Save device state.
+        let (disk_path, rate_limiter_state, file_engine_type, virtio_state) =
+            if let BlockState::Active(ActiveBlock::Threaded(ta)) = &self.state {
+                let st = ta.worker_handle.get_saved_state();
+                (
+                    st.disk_path,
+                    st.rate_limiter_state,
+                    st.file_engine_type,
+                    VirtioDeviceState {
+                        device_type: VirtioDeviceType::Block,
+                        avail_features: self.avail_features,
+                        acked_features: self.acked_features,
+                        queues: st.queue_state,
+                        activated: true,
+                    }
+                )
+            } else {
+                (
+                 self.disk().file_path.clone(),
+                 self.rate_limiter().save(),
+                 FileEngineTypeState::from(self.file_engine_type()),
+                 VirtioDeviceState::from_device(self),
+                )
+            };
 
         VirtioBlockState {
             id: self.id.clone(),
             partuuid: self.partuuid.clone(),
             cache_type: self.cache_type,
             root_device: self.root_device,
-            disk_path: self.disk().file_path.clone(),
-            virtio_state: VirtioDeviceState::from_device(self),
-            rate_limiter_state: self.rate_limiter().save(),
-            file_engine_type: FileEngineTypeState::from(self.file_engine_type()),
+            disk_path,
+            virtio_state,
+            rate_limiter_state,
+            file_engine_type,
             threaded: self.threaded,
         }
     }

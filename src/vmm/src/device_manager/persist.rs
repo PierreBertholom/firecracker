@@ -21,6 +21,7 @@ use crate::devices::acpi::vmgenid::{VMGenIDState, VmGenId};
 use crate::devices::legacy::RTCDevice;
 use crate::devices::virtio::balloon::Balloon;
 use crate::devices::virtio::balloon::persist::{BalloonConstructorArgs, BalloonState};
+use crate::devices::virtio::block::BlockError;
 use crate::devices::virtio::block::device::Block;
 use crate::devices::virtio::block::persist::{BlockConstructorArgs, BlockState};
 use crate::devices::virtio::device::{VirtioDevice, VirtioDeviceType};
@@ -459,13 +460,16 @@ impl<'a> Persist<'a> for MMIODeviceManager {
                 &block_state.device_state,
             )?));
 
-            device.lock()
-                .expect("Poisoned lock")
-                .set_worker_filter(constructor_args.seccomp_filters
-                    .get("blk_worker")
-                    .expect("Missing blk_worker seccomp filter")
-                    .clone()
+            {
+                let mut blk = device.lock().expect("Poisoned lock");
+                blk.set_worker_filter(
+                    constructor_args.seccomp_filters
+                        .get("blk_worker")
+                        .expect("Missing blk_worker seccomp filter")
+                        .clone(),
                 );
+                blk.spawn_worker().map_err(BlockError::VirtioBackend)?;
+            }
 
             constructor_args
                 .vm_resources
