@@ -686,7 +686,9 @@ impl ThreadedWorker {
             ControlMsg::Pause => self.pause_worker(ops),
             ControlMsg::Reset => self.reset_worker(ops),
             ControlMsg::Kick => {
+                if matches!(self.state, WorkerState::Paused(_)) {
                 self.resume_worker(ops);
+                }
                 // process directly instead of going through epoll (regular kick)
                 if let WorkerState::Running(worker) = &mut self.state {
                     worker
