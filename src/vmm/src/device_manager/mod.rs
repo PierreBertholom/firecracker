@@ -459,6 +459,7 @@ impl DeviceManager {
         vm: Arc<KvmVm>,
         config: HotplugDeviceConfig,
         event_manager: &mut EventManager,
+        seccomp_filters: &BpfThreadMap,
     ) -> Result<(), VmmActionError> {
         let dev_type = config.device_type();
         let dev_id = config.device_id().to_string();
@@ -474,7 +475,7 @@ impl DeviceManager {
         }
 
         let device = match config {
-            HotplugDeviceConfig::Block(cfg) => Self::hotplug_make_block(cfg)?,
+            HotplugDeviceConfig::Block(cfg) => Self::hotplug_make_block(cfg, seccomp_filters)?,
             HotplugDeviceConfig::Pmem(cfg) => Self::hotplug_make_pmem(vm.clone(), cfg)?,
             HotplugDeviceConfig::Net(cfg) => self.hotplug_make_net(cfg)?,
         };
@@ -489,12 +490,26 @@ impl DeviceManager {
 
     fn hotplug_make_block(
         config: BlockDeviceConfig,
+        seccomp_filters: &BpfThreadMap,
     ) -> Result<Arc<Mutex<dyn VirtioDevice>>, VmmActionError> {
         if config.is_root_device {
             return Err(DriveError::RootBlockDeviceAlreadyAdded.into());
         }
 
-        let block = Block::new(config).map_err(DriveError::CreateBlockDevice)?;
+        let threaded = config.threaded;
+        let mut block = Block::new(config).map_err(DriveError::CreateBlockDevice)?;
+        if threaded {
+            block.set_worker_filter(
+                seccomp_filters
+                    .get("blk_worker")
+                    .expect("Missing blk_worker seccomp filter")
+                    .clone(),
+            );
+            block
+                .spawn_worker()
+                .map_err(|err| DriveError::CreateBlockDevice(BlockError::VirtioBackend(err)))?;
+        }
+
         Ok(Arc::new(Mutex::new(block)))
     }
 
@@ -791,6 +806,7 @@ pub(crate) mod tests {
     use crate::devices::acpi::vmgenid::VmGenId;
     use crate::devices::virtio::block::CacheType;
     use crate::rpc_interface::VmmActionError;
+    use crate::seccomp::BpfThreadMap;
     use crate::vmm_config::HotplugDeviceConfig;
     use crate::vmm_config::drive::{BlockDeviceConfig, DriveError};
     use crate::vmm_config::net::{NetworkInterfaceConfig, NetworkInterfaceError};
@@ -925,12 +941,13 @@ pub(crate) mod tests {
     #[test]
     fn test_hotplug_block() {
         let mut evt_manager = EventManager::new().unwrap();
+        let seccomp_filters = BpfThreadMap::new();
         let mut vmm = default_vmm_with_pci();
         let f = TempFile::new().unwrap();
 
         // Successful case
         let cfg = HotplugDeviceConfig::Block(make_hotplug_block_cfg("block0", &f, false));
-        vmm.hotplug_device(cfg, &mut evt_manager).unwrap();
+        vmm.hotplug_device(cfg, &mut evt_manager, &seccomp_filters).unwrap();
         assert!(
             pci_devices(&vmm.device_manager)
                 .virtio_devices
@@ -940,14 +957,14 @@ pub(crate) mod tests {
         // Duplicate device ID is rejected
         let cfg2 = HotplugDeviceConfig::Block(make_hotplug_block_cfg("block0", &f, false));
         assert!(matches!(
-            vmm.hotplug_device(cfg2, &mut evt_manager),
+            vmm.hotplug_device(cfg2, &mut evt_manager, &seccomp_filters),
             Err(VmmActionError::DeviceIdInUse)
         ));
 
         // Root block device is rejected
         let cfg3 = HotplugDeviceConfig::Block(make_hotplug_block_cfg("block1", &f, true));
         assert!(matches!(
-            vmm.hotplug_device(cfg3, &mut evt_manager),
+            vmm.hotplug_device(cfg3, &mut evt_manager, &seccomp_filters),
             Err(VmmActionError::DriveConfig(
                 DriveError::RootBlockDeviceAlreadyAdded
             ))
@@ -975,11 +992,12 @@ pub(crate) mod tests {
     fn test_hotplug_pci_not_enabled() {
         let mut vmm = default_vmm();
         let mut evt_manager = EventManager::new().unwrap();
+        let seccomp_filters = BpfThreadMap::new();
         let f = TempFile::new().unwrap();
 
         let cfg = HotplugDeviceConfig::Block(make_hotplug_block_cfg("block0", &f, false));
         assert!(matches!(
-            vmm.hotplug_device(cfg, &mut evt_manager),
+            vmm.hotplug_device(cfg, &mut evt_manager, &seccomp_filters),
             Err(VmmActionError::PciNotEnabled)
         ));
     }
@@ -1012,6 +1030,7 @@ pub(crate) mod tests {
     fn test_hotplug_pmem() {
         let mut vmm = default_vmm_with_pci();
         let mut evt_manager = EventManager::new().unwrap();
+        let seccomp_filters = BpfThreadMap::new();
         let f = TempFile::new().unwrap();
         f.as_file().set_len(0x1000).unwrap();
 
@@ -1023,7 +1042,7 @@ pub(crate) mod tests {
             read_only: false,
             ..Default::default()
         });
-        vmm.hotplug_device(cfg, &mut evt_manager).unwrap();
+        vmm.hotplug_device(cfg, &mut evt_manager, &seccomp_filters).unwrap();
         assert!(
             pci_devices(&vmm.device_manager)
                 .virtio_devices
@@ -1040,7 +1059,7 @@ pub(crate) mod tests {
             ..Default::default()
         });
         assert!(matches!(
-            vmm.hotplug_device(cfg2, &mut evt_manager),
+            vmm.hotplug_device(cfg2, &mut evt_manager, &seccomp_filters),
             Err(VmmActionError::PmemConfig(
                 PmemConfigError::AddingSecondRootDevice
             ))
@@ -1068,6 +1087,7 @@ pub(crate) mod tests {
     fn test_hotplug_net() {
         let mut vmm = default_vmm_with_pci();
         let mut evt_manager = EventManager::new().unwrap();
+        let seccomp_filters = BpfThreadMap::new();
 
         let mac = "AA:FC:00:00:00:01";
 
@@ -1080,7 +1100,7 @@ pub(crate) mod tests {
             rx_rate_limiter: None,
             tx_rate_limiter: None,
         });
-        vmm.hotplug_device(cfg, &mut evt_manager).unwrap();
+        vmm.hotplug_device(cfg, &mut evt_manager, &seccomp_filters).unwrap();
         assert!(
             pci_devices(&vmm.device_manager)
                 .virtio_devices
@@ -1097,7 +1117,7 @@ pub(crate) mod tests {
             tx_rate_limiter: None,
         });
         assert!(matches!(
-            vmm.hotplug_device(cfg2, &mut evt_manager),
+            vmm.hotplug_device(cfg2, &mut evt_manager, &seccomp_filters),
             Err(VmmActionError::NetworkConfig(
                 NetworkInterfaceError::GuestMacAddressInUse(_)
             ))
