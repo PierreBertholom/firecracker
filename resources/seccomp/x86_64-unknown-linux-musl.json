@@ -766,11 +766,16 @@
             },
             {
                 "syscall": "clone",
-                "comment": "Used to spawn worker thread //TODO: add args"
-            },
-            {
-                "syscall": "clone3",
-                "comment": "Used to spawn worker thread //TODO: add args"
+                "comment": "Used by musl pthread_create to spawn the block worker thread",
+                "args": [
+                    {
+                        "index": 0,
+                        "type": "dword",
+                        "op": {"masked_eq": 4290772991},
+                        "val": 4001536,
+                        "comment": "Require the pthread clone flags and allow only the optional obsolete CLONE_DETACHED bit"
+                    }
+                ]
             },
             {
                 "syscall": "prctl",
@@ -1573,11 +1578,41 @@
                 "syscall": "rt_sigprocmask"
             },
             {
+                "syscall": "rt_sigaction",
+                "comment": "rt_sigaction is used by libc::abort during a panic to install the default handler for SIGABRT",
+                "args": [
+                    {
+                        "index": 0,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 6,
+                        "comment": "SIGABRT"
+                    }
+                ]
+            },
+            {
                 "syscall": "getrandom"
             },
             {
                 "syscall": "exit",
                 "comment": "Worker thread exit on Finish"
+            },
+            {
+                "syscall": "exit_group",
+                "comment": "Used to terminate the process after a panic"
+            },
+            {
+                "syscall": "tkill",
+                "comment": "tkill is used by libc::abort during a panic to raise SIGABRT",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 6,
+                        "comment": "SIGABRT"
+                    }
+                ]
             },
             {
                 "syscall": "epoll_pwait"

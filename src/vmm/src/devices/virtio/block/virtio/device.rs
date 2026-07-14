@@ -834,10 +834,8 @@ impl VirtioDevice for VirtioBlock {
 }
 
 impl ThreadedActive {
-    fn teardown(self, flush_mode: FlushMode) -> BlockResources {
-        self.worker_handle
-            .finish(flush_mode)
-            .expect("active threaded worker returns its resources on teardown")
+    fn teardown(self, flush_mode: FlushMode) {
+        self.worker_handle.finish(flush_mode);
     }
 }
 
@@ -849,7 +847,7 @@ impl Drop for VirtioBlock {
         };
         match std::mem::replace(&mut self.state, BlockState::Placeholder)
         {
-            BlockState::Active(ActiveBlock::Threaded(ab)) => { let _ = ab.teardown(flush_mode); },
+            BlockState::Active(ActiveBlock::Threaded(ab)) => ab.teardown(flush_mode),
             BlockState::Active(ActiveBlock::Inline(mut ab)) => {
                 match flush_mode {
                     FlushMode::Drain => { ab.worker.drain(true); },
@@ -857,7 +855,7 @@ impl Drop for VirtioBlock {
                 }
             }
             // drop before activated, still finish thread clean even tho nothing to drain
-            BlockState::Configuring(_, Some(handle)) => { let _ = handle.finish(FlushMode::Drain); },
+            BlockState::Configuring(_, Some(handle)) => handle.finish(FlushMode::Drain),
             _ => {}
         };
     }
@@ -885,6 +883,7 @@ mod tests {
     use crate::devices::virtio::queue::{VIRTQ_DESC_F_NEXT, VIRTQ_DESC_F_WRITE};
     use crate::devices::virtio::test_utils::{VirtQueue, default_interrupt, default_mem};
     use crate::rate_limiter::TokenType;
+    use crate::snapshot::Persist;
     use crate::vstate::memory::{Address, Bytes, GuestAddress};
 
     #[test]
@@ -2065,5 +2064,36 @@ mod tests {
             block.disk().file_engine.file().metadata().unwrap().st_ino(),
             mdata.st_ino()
         );
+    }
+
+    #[test]
+    fn test_threaded_lifecycle() {
+        for engine in [FileEngineType::Sync, FileEngineType::Async] {
+            let mut block = default_block(engine);
+            block.threaded = true;
+            block.spawn_worker().unwrap();
+
+            let mem = default_mem();
+            let vq = VirtQueue::new(GuestAddress(0), &mem, 16);
+            set_queue(&mut block, 0, vq.create_queue());
+            block.activate(mem.clone(), default_interrupt()).unwrap();
+
+            block.prepare_save();
+            let state = block.save();
+            assert!(state.virtio_state.activated);
+            block.mark_queue_memory_dirty(&mem).unwrap();
+
+            block.update_rate_limiter(BucketUpdate::Disabled, BucketUpdate::Disabled);
+            block.kick();
+            assert!(block.reset());
+            assert!(!block.is_activated());
+            assert_eq!(block.acked_features(), 0);
+            assert!(block.rate_limiter().bandwidth().is_none());
+            assert!(block.rate_limiter().ops().is_none());
+
+            set_queue(&mut block, 0, vq.create_queue());
+            block.activate(mem.clone(), default_interrupt()).unwrap();
+            assert!(block.is_activated());
+        }
     }
 }
