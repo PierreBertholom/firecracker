@@ -484,6 +484,12 @@ def io_engine(request):
     return request.param
 
 
+@pytest.fixture(params=[False, True], ids=["inline", "threaded"])
+def threaded(request):
+    """Whether the block device uses the multithreaded worker"""
+    return request.param
+
+
 @pytest.fixture(
     params=[SnapshotType.DIFF, SnapshotType.DIFF_MINCORE, SnapshotType.FULL]
 )
