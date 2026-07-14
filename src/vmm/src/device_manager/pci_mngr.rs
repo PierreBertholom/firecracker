@@ -15,6 +15,7 @@ use crate::device_manager::DevicePersistError;
 use crate::devices::pci::PciSegment;
 use crate::devices::virtio::balloon::Balloon;
 use crate::devices::virtio::balloon::persist::{BalloonConstructorArgs, BalloonState};
+use crate::devices::virtio::block::BlockError;
 use crate::devices::virtio::block::device::Block;
 use crate::devices::virtio::block::persist::{BlockConstructorArgs, BlockState};
 use crate::devices::virtio::device::{VirtioDevice, VirtioDeviceId, VirtioDeviceType};
@@ -520,13 +521,16 @@ impl<'a> Persist<'a> for PciDevices {
                 &block_state.device_state,
             )?));
 
-            device.lock()
-                .expect("Poisoned lock")
-                .set_worker_filter(constructor_args.seccomp_filters
-                    .get("blk_worker")
-                    .expect("Missing blk_worker seccomp filter")
-                    .clone()
+            {
+                let mut blk = device.lock().expect("Poisoned lock");
+                blk.set_worker_filter(
+                    constructor_args.seccomp_filters
+                        .get("blk_worker")
+                        .expect("Missing blk_worker seccomp filter")
+                        .clone(),
                 );
+                blk.spawn_worker().map_err(BlockError::VirtioBackend)?;
+            }
 
             constructor_args
                 .vm_resources

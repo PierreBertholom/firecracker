@@ -18,11 +18,18 @@ use crate::rate_limiter::BucketUpdate;
 use crate::seccomp::{BpfProgram, apply_filter};
 use vmm_sys_util::epoll::EventSet;
 use vmm_sys_util::eventfd::EventFd;
+use crate::devices::virtio::ActivateError;
 use crate::devices::virtio::block::CacheType;
 use crate::devices::virtio::block::virtio::io::{async_io, FileEngine};
-use crate::devices::virtio::queue::{InvalidAvailIdx, Queue};
+use crate::devices::virtio::block::virtio::persist::FileEngineTypeState;
+use crate::devices::virtio::persist::QueueState;
+use crate::devices::virtio::queue::{InvalidAvailIdx, Queue, QueueError};
 use crate::devices::virtio::transport::VirtioInterruptType;
 use crate::logger::{IncMetric, error, warn};
+use crate::rate_limiter::persist::RateLimiterState;
+use crate::snapshot::Persist;
+use crate::vmm_config::drive::FileEngineType;
+use crate::vstate::memory::GuestMemoryMmap;
 
 /// Worker block device data
 #[derive(Debug)]
@@ -38,6 +45,13 @@ pub(crate) struct ThreadedWorker {
     control_evt: EventFd,
     control_rx: Receiver<ControlMsg>,
     response_tx: Sender<ControlResponse>,
+}
+
+pub(crate) struct SavedState {
+    pub queue_state: Vec<QueueState>,
+    pub rate_limiter_state: RateLimiterState,
+    pub disk_path: String,
+    pub file_engine_type: FileEngineTypeState,
 }
 
 #[derive(Debug)]
@@ -60,7 +74,8 @@ enum ControlMsg {
     UpdateRateLimiter(BucketUpdate, BucketUpdate),
     Kick,
     Pause,
-    Resume,
+    GetSavedState,
+    MarkQMemDirty,
     Reset,
     Finish(FlushMode),
 }
@@ -69,6 +84,8 @@ enum ControlMsg {
 enum ControlResponse {
     DiskUpdated(Result<u64, VirtioBlockError>), // nsectors / error
     Paused, // ACK
+    SaveReady(SavedState),
+    QMemDirty(Result<(), QueueError>),
     Reset(Option<BlockResources>),
 }
 
@@ -78,8 +95,8 @@ pub(crate) struct WorkerHandle {
     receiver_rx: Receiver<ControlResponse>,
     control_evt: EventFd,
     join: JoinHandle<Option<BlockResources>>,
+    queue_evts: Vec<EventFd>,
 }
-
 macro_rules! unwrap_async_file_engine_or_return {
     ($file_engine: expr) => {
         match $file_engine {
@@ -94,13 +111,14 @@ macro_rules! unwrap_async_file_engine_or_return {
 
 impl WorkerHandle {
     pub(crate) fn spawn(
-        seccomp_filter: Arc<BpfProgram>
+        seccomp_filter: Arc<BpfProgram>,
+        queue_evts: Vec<EventFd>,
     ) -> Result<WorkerHandle, std::io::Error> {
         // One kick eventfd, shared between worker (registers on its epoll) and shell (writes to
         // wake it). Both refer to the same kernel object via try_clone.
         let control_evt = EventFd::new(libc::EFD_NONBLOCK)?;
         let handle_evt = control_evt.try_clone()?;
-
+        
         let (control_tx, control_rx) = channel::<ControlMsg>();
         let (response_tx, receiver_rx) = channel::<ControlResponse>();
 
@@ -122,8 +140,11 @@ impl WorkerHandle {
             receiver_rx,
             control_evt: handle_evt,
             join,
+            queue_evts,
         })
     }
+
+    pub(crate) fn queue_events(&self) -> &[EventFd] { &self.queue_evts }
 
     pub(crate) fn start(&self, worker: BlockWorker) {
         if let Err(e) = self.control_tx.send(ControlMsg::Start(worker)) {
@@ -150,6 +171,98 @@ impl WorkerHandle {
         })
     }
 
+    pub(crate) fn pause(&self) {
+        if let Err(e) = self.control_tx.send(ControlMsg::Pause) {
+            error!("Block receiver already dropped on pause: {:?}", e);
+        }
+
+        if let Err(e) = self.control_evt.write(1) {
+            error!("Block control event is closed on pause: {:?}", e);
+        }
+
+        loop {
+            match self.receiver_rx.recv() {
+                Ok(ControlResponse::Paused) => return,
+                Ok(ControlResponse::DiskUpdated(_)) => {
+                    warn!("Ignoring disk update response while waiting for pause");
+                }
+                Ok(ControlResponse::SaveReady(_)) => {
+                    warn!("Ignoring saved state response while waiting for pause");
+                }
+                Ok(ControlResponse::Reset(_)) => {
+                    warn!("Ignoring reset response while waiting for pause");
+                }
+                Ok(ControlResponse::QMemDirty(_)) => {
+                    warn!("Ignoring marking queue memory dirty response while waiting for disk update");
+                }
+                Err(e) => {
+                    error!("Block worker failed to acknowledge pause: {:?}", e);
+                }
+            }
+        }
+    }
+
+    pub(crate) fn get_saved_state(&self) -> SavedState {
+        if let Err(e) = self.control_tx.send(ControlMsg::GetSavedState) {
+            error!("Block receiver already dropped on pause: {:?}", e);
+        }
+
+        if let Err(e) = self.control_evt.write(1) {
+            error!("Block control event is closed on pause: {:?}", e);
+        }
+
+        loop {
+            match self.receiver_rx.recv() {
+                Ok(ControlResponse::SaveReady(st)) => return st,
+                Ok(ControlResponse::DiskUpdated(_)) => {
+                    warn!("Ignoring disk update response while waiting for saved state");
+                }
+                Ok(ControlResponse::Paused) => {
+                    warn!("Ignoring pause response while waiting for saved state");
+                }
+                Ok(ControlResponse::Reset(_)) => {
+                    warn!("Ignoring reset response while waiting for saved state");
+                }
+                Ok(ControlResponse::QMemDirty(_)) => {
+                    warn!("Ignoring marking queue memory dirty response while waiting for disk update");
+                }
+                Err(e) => {
+                    error!("Block worker failed to acknowledge saved state: {:?}", e);
+                }
+            }
+        }
+    }
+    pub(crate) fn mark_queue_memory_dirty(&self, mem: &GuestMemoryMmap) -> Result<(), QueueError> {
+        if let Err(e) = self.control_tx.send(ControlMsg::MarkQMemDirty) {
+            error!("Block receiver already dropped on pause: {:?}", e);
+        }
+
+        if let Err(e) = self.control_evt.write(1) {
+            error!("Block control event is closed on pause: {:?}", e);
+        }
+
+        loop {
+            match self.receiver_rx.recv() {
+                Ok(ControlResponse::QMemDirty(r)) => return r,
+                Ok(ControlResponse::SaveReady(_)) => {
+                    warn!("Ignoring saved state response while waiting for pause");
+                },
+                Ok(ControlResponse::DiskUpdated(_)) => {
+                    warn!("Ignoring disk update response while waiting for saved state");
+                }
+                Ok(ControlResponse::Paused) => {
+                    warn!("Ignoring pause response while waiting for saved state");
+                }
+                Ok(ControlResponse::Reset(_)) => {
+                    warn!("Ignoring reset response while waiting for saved state");
+                }
+                Err(e) => {
+                    error!("Block worker failed to acknowledge saved state: {:?}", e);
+                }
+            }
+        }
+    }
+
     pub(crate) fn reset(&self) -> Option<BlockResources> {
         if let Err(e) = self.control_tx.send(ControlMsg::Reset) {
             error!("Block receiver already dropped on reset: {:?}", e);
@@ -169,6 +282,12 @@ impl WorkerHandle {
                 }
                 Ok(ControlResponse::Paused) => {
                     warn!("Ignoring pause response while waiting for reset");
+                }
+                Ok(ControlResponse::SaveReady(_)) => {
+                    warn!("Ignoring saved state response while waiting for reset");
+                }
+                Ok(ControlResponse::QMemDirty(_)) => {
+                    warn!("Ignoring marking queue memory dirty response while waiting for disk update");
                 }
                 Err(e) => {
                     error!("Block worker failed to acknowledge reset: {:?}", e);
@@ -196,11 +315,17 @@ impl WorkerHandle {
         loop {
             match self.receiver_rx.recv() {
                 Ok(ControlResponse::DiskUpdated(result)) => return result,
+                Ok(ControlResponse::Paused) => {
+                    warn!("Ignoring pause response while waiting for disk update");
+                }
+                Ok(ControlResponse::SaveReady(_)) => {
+                    warn!("Ignoring saved state response while waiting for disk update");
+                }
                 Ok(ControlResponse::Reset(_)) => {
                     warn!("Ignoring reset response while waiting for disk update");
                 }
-                Ok(ControlResponse::Paused) => {
-                    warn!("Ignoring pause response while waiting for disk update");
+                Ok(ControlResponse::QMemDirty(_)) => {
+                    warn!("Ignoring marking queue memory dirty response while waiting for disk update");
                 }
                 Err(e) => {
                     error!("Block worker failed to acknowledge disk update: {:?}", e);
@@ -559,9 +684,9 @@ impl ThreadedWorker {
                 }
             }
             ControlMsg::Pause => self.pause_worker(ops),
-            ControlMsg::Resume => self.resume_worker(ops),
             ControlMsg::Reset => self.reset_worker(ops),
             ControlMsg::Kick => {
+                self.resume_worker(ops);
                 // process directly instead of going through epoll (regular kick)
                 if let WorkerState::Running(worker) = &mut self.state {
                     worker
@@ -570,6 +695,36 @@ impl ThreadedWorker {
                 }
             }
             ControlMsg::Finish(flush_mode) => self.finish_worker(flush_mode, ops),
+            ControlMsg::GetSavedState => {
+                if let WorkerState::Paused(worker) | WorkerState::Running(worker) = &self.state {
+                    let saved_state = SavedState {
+                        queue_state: worker.resources.queues.iter().map(Persist::save).collect(),
+                        rate_limiter_state: worker.resources.rate_limiter.save(),
+                        disk_path: worker.resources.disk.file_path.clone(),
+                        file_engine_type: match worker.resources.disk.file_engine {
+                            FileEngine::Async(_) => FileEngineTypeState::Async,
+                            FileEngine::Sync(_) => FileEngineTypeState::Sync,
+                        },
+                    };
+                    if let Err(err) = self.response_tx.send(ControlResponse::SaveReady(saved_state)) {
+                        error!("Failed to send DiskUpdated ACK: {:?}", err);
+                    }
+                }
+            }
+            ControlMsg::MarkQMemDirty => {
+                let mut result = Ok(());
+                if let WorkerState::Paused(worker) = &mut self.state {
+                    let mem = worker.active_state.mem.clone();
+                    for queue in worker.resources.queues.iter_mut() {
+                        // mark them dirty for next snapshot
+                        if let Err(e) = queue.initialize(&mem) {
+                            result = Err(e);
+                            break;
+                        }
+                    }
+                }
+                let _ = self.response_tx.send(ControlResponse::QMemDirty(result));
+            }
         }
     }
 

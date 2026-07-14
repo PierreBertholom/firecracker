@@ -13,7 +13,7 @@ use super::virtio::device::{VirtioBlock, VirtioBlockConfig};
 use crate::devices::virtio::ActivateError;
 use crate::devices::virtio::block::virtio::VirtioBlockError;
 use crate::devices::virtio::device::{VirtioDevice, VirtioDeviceType};
-use crate::devices::virtio::queue::{InvalidAvailIdx, Queue};
+use crate::devices::virtio::queue::{InvalidAvailIdx, Queue, QueueError};
 use crate::devices::virtio::transport::VirtioInterrupt;
 use crate::impl_device_type;
 use crate::rate_limiter::BucketUpdate;
@@ -242,6 +242,14 @@ impl VirtioDevice for Block {
         match self {
             Self::Virtio(b) => b.kick(),
             Self::VhostUser(b) => b.kick(),
+        }
+    }
+
+    fn mark_queue_memory_dirty(&mut self, mem: &GuestMemoryMmap) -> Result<(), QueueError> {
+        match self {
+            // overwritten to avoid queues_mut() access when threaded
+            Self::Virtio(b) => b.mark_queue_memory_dirty(mem),
+            Self::VhostUser(b) => b.mark_queue_memory_dirty(mem),
         }
     }
 
