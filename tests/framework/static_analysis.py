@@ -296,15 +296,30 @@ class ArchitectureX86_64(  # pylint: disable=invalid-name
     @staticmethod
     def generalize_reg(reg: str) -> list[str]:
         suffixes = ["ax", "bx", "cx", "dx", "si", "di", "bp", "sp"]
+        byte_registers = {
+            "ax": "%al",
+            "bx": "%bl",
+            "cx": "%cl",
+            "dx": "%dl",
+            "si": "%sil",
+            "di": "%dil",
+            "bp": "%bpl",
+            "sp": "%spl",
+        }
         prefixes = ["%r8", "%r9", "%r10", "%r11", "%r12", "%r13", "%r14", "%r15"]
 
         for suffix in suffixes:
             if reg.endswith(suffix):
-                return [f"%r{suffix}", f"%e{suffix}", f"%{suffix}"]
+                return [
+                    f"%r{suffix}",
+                    f"%e{suffix}",
+                    f"%{suffix}",
+                    byte_registers[suffix],
+                ]
 
         for prefix in prefixes:
             if reg.startswith(prefix):
-                return [prefix, f"{prefix}d", f"{prefix}w"]
+                return [prefix, f"{prefix}d", f"{prefix}w", f"{prefix}b"]
 
         return [reg]
 
@@ -573,9 +588,11 @@ def load_seccomp_rules(seccomp_path: Path):
     For 'masked_eq' comparisons, mask is the bitmask value."""
     filters = json.loads(seccomp_path.read_text("utf-8"))
 
-    all_filters = (
-        filters["vcpu"]["filter"] + filters["vmm"]["filter"] + filters["api"]["filter"]
-    )
+    all_filters = [
+        seccomp_filter
+        for thread_filter in filters.values()
+        for seccomp_filter in thread_filter["filter"]
+    ]
     allowlist = defaultdict(list)
 
     for seccomp_filter in all_filters:

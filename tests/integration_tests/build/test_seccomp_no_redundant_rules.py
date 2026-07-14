@@ -9,6 +9,8 @@ from pathlib import Path
 
 from framework import utils
 from framework.static_analysis import (
+    ArchitectureX86_64,
+    InstructionX86_64,
     determine_unneeded_seccomp_rules,
     find_syscalls_in_binary,
     load_seccomp_rules,
@@ -16,6 +18,16 @@ from framework.static_analysis import (
 
 # Make sure we don't override the Firecracker binary used from other tests
 TMP_BUILD_DIR = "../redundant_seccomp_rules_build"
+
+
+def test_x86_low_byte_register_alias():
+    """Resolve syscall numbers loaded through a register's low byte."""
+    instructions = [
+        InstructionX86_64.from_str("xor %eax,%eax"),
+        InstructionX86_64.from_str("mov $0x38,%al"),
+    ]
+
+    assert ArchitectureX86_64.determine_register_value(instructions, "%eax") == 56
 
 
 def test_redundant_seccomp_rules():

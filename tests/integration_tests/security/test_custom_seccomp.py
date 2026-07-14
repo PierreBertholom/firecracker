@@ -21,7 +21,7 @@ def test_allow_all(uvm, seccompiler):
     """Test --seccomp-filter, allowing all syscalls."""
     seccomp_filter = {
         thread: {"default_action": "allow", "filter_action": "trap", "filter": []}
-        for thread in ["vmm", "api", "vcpu"]
+        for thread in ["vmm", "api", "vcpu", "blk_worker"]
     }
 
     bpf_path = seccompiler.compile(seccomp_filter)
@@ -43,7 +43,7 @@ def test_working_filter(uvm, seccompiler):
             "filter_action": "kill_process",
             "filter": [{"syscall": "clone"}, {"syscall": "execve"}],
         }
-        for thread in ["vmm", "api", "vcpu"]
+        for thread in ["vmm", "api", "vcpu", "blk_worker"]
     }
 
     bpf_path = seccompiler.compile(seccomp_filter)
@@ -68,6 +68,11 @@ def test_failing_filter(uvm, seccompiler):
             "default_action": "allow",
             "filter_action": "trap",
             "filter": [{"syscall": "ioctl"}],
+        },
+        "blk_worker": {
+            "default_action": "allow",
+            "filter_action": "trap",
+            "filter": [],
         },
     }
 

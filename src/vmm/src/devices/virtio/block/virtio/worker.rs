@@ -59,7 +59,7 @@ enum WorkerState {
     Parked,
     Running(BlockWorker),
     Paused(BlockWorker),
-    Finished(Option<BlockResources>),
+    Finished,
 }
 
 pub(crate) enum FlushMode {
@@ -94,7 +94,7 @@ pub(crate) struct WorkerHandle {
     control_tx: Sender<ControlMsg>,
     receiver_rx: Receiver<ControlResponse>,
     control_evt: EventFd,
-    join: JoinHandle<Option<BlockResources>>,
+    join: JoinHandle<()>,
     queue_evts: Vec<EventFd>,
 }
 macro_rules! unwrap_async_file_engine_or_return {
@@ -156,7 +156,7 @@ impl WorkerHandle {
         }
     }
 
-    pub(crate) fn finish(self, flush_mode: FlushMode) -> Option<BlockResources> {
+    pub(crate) fn finish(self, flush_mode: FlushMode) {
         if let Err(e) = self.control_tx.send(ControlMsg::Finish(flush_mode)) {
             error!("Block receiver already dropped on teardown: {:?}", e);
         }
@@ -167,8 +167,7 @@ impl WorkerHandle {
 
         self.join.join().unwrap_or_else(|e| {
             error!("Block worker thread panicking during teardown: {:?}", e);
-            None
-        })
+        });
     }
 
     pub(crate) fn pause(&self) {
@@ -798,8 +797,8 @@ impl ThreadedWorker {
                 if let Err(err) = self.response_tx.send(ControlResponse::Reset(None))
                 { error!("Failed to send Reset ACK: {:?}", err); }
             }
-            WorkerState::Finished(resources) => {
-                self.state = WorkerState::Finished(resources);
+            WorkerState::Finished => {
+                self.state = WorkerState::Finished;
             }
         }
     }
@@ -809,19 +808,13 @@ impl ThreadedWorker {
             WorkerState::Running(mut worker) => {
                 Self::unregister_runtime_events(&worker.resources, ops);
                 Self::flush_worker(&mut worker, flush_mode);
-                self.state = WorkerState::Finished(Some(worker.resources));
             }
             WorkerState::Paused(mut worker) => {
                 Self::flush_worker(&mut worker, flush_mode);
-                self.state = WorkerState::Finished(Some(worker.resources));
             }
-            WorkerState::Parked => {
-                self.state = WorkerState::Finished(None);
-            }
-            WorkerState::Finished(resources) => {
-                self.state = WorkerState::Finished(resources);
-            }
+            WorkerState::Parked | WorkerState::Finished => {}
         }
+        self.state = WorkerState::Finished;
     }
 
     fn flush_worker(worker: &mut BlockWorker, flush_mode: FlushMode) {
@@ -835,12 +828,12 @@ impl ThreadedWorker {
     fn worker_mut(&mut self) -> Option<&mut BlockWorker> {
         match &mut self.state {
             WorkerState::Running(worker) | WorkerState::Paused(worker) => Some(worker),
-            WorkerState::Parked | WorkerState::Finished(_) => None,
+            WorkerState::Parked | WorkerState::Finished => None,
         }
     }
 
     fn is_finished(&self) -> bool {
-        matches!(self.state, WorkerState::Finished(_))
+        matches!(self.state, WorkerState::Finished)
     }
 }
 
@@ -849,7 +842,7 @@ fn run_worker_loop(
     control_evt: EventFd,
     control_rx: Receiver<ControlMsg>,
     response_tx: Sender<ControlResponse>,
-) -> Option<BlockResources> {
+) {
     let worker = Arc::new(Mutex::new(ThreadedWorker {
         state: WorkerState::Parked,
         control_evt,
@@ -871,15 +864,11 @@ fn run_worker_loop(
     // drop the EventManager FIRST to release the subscriber clone
     // it holds, so worker_arc reaches strong_count == 1 and try_unwrap succeeds.
     drop(event_manager);
-    match Arc::try_unwrap(worker)
+    let worker = Arc::try_unwrap(worker)
         .expect("Block worker refs outlived event loop")
         .into_inner()
-        .expect("Poisoned lock")
-        .state
-    {
-        WorkerState::Finished(resources) => resources,
-        _ => unreachable!("block worker exited without Finished state"),
-    }
+        .expect("Poisoned lock");
+    assert!(matches!(worker.state, WorkerState::Finished));
 }
 
 impl MutEventSubscriber for ThreadedWorker {
