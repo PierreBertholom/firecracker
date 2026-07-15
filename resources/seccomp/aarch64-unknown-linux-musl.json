@@ -1584,6 +1584,19 @@
             {
                 "syscall": "fstat",
                 "comment": "Used by disk update"
+            },
+            {
+                "syscall": "ioctl",
+                "comment": "Needed for unregistering irqfds when the block worker drops its interrupt group during device reset or teardown",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 1075883638,
+                        "comment": "KVM_IRQFD"
+                    }
+                ]
             }
         ]
     }
