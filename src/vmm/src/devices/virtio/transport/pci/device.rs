@@ -625,7 +625,7 @@ impl VirtioPciDevice {
         for i in 0..device.num_queues() {
             let queue_evt = device
                 .queue_event(i)
-                .expect("queue event must exist for each advertised queue");
+                .expect("queue event must exist for each queue");
             let notify_base = bar_addr + u64::from(NOTIFICATION_BAR_OFFSET);
             let io_addr =
                 IoEventAddress::Mmio(notify_base + i as u64 * u64::from(NOTIFY_OFF_MULTIPLIER));

@@ -234,7 +234,7 @@ pub trait VirtioDevice: AsAny + MutEventSubscriber + Send {
         for i in 0..self.num_queues() {
             let eventfd = self
                 .queue_event(i)
-                .expect("queue event must exist for each advertised queue");
+                .expect("queue event must exist for each queue");
             if let Err(err) = eventfd.write(1) {
                 error!(
                     "[{:?}:{}] error notifying queue {}: {}",
@@ -254,7 +254,7 @@ pub trait VirtioDevice: AsAny + MutEventSubscriber + Send {
         for i in 0..self.num_queues() {
             let event = self
                 .queue_event(i)
-                .expect("queue event must exist for each advertised queue");
+                .expect("queue event must exist for each queue");
             event.read();
         }
     }

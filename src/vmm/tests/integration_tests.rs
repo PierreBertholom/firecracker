@@ -434,6 +434,7 @@ fn test_preboot_load_snap_disallowed_after_boot_resources() {
 
         is_read_only: Some(false),
         threaded: false,
+        num_queues: 1,
         path_on_host: Some(tmp_file),
         rate_limiter: None,
         file_engine_type: None,

@@ -59,6 +59,8 @@ pub enum ActivateError {
     QueueMismatch { expected: usize, got: usize },
     /// Failed to write to activate eventfd
     EventFd,
+    /// Failed to start block worker: {0}
+    BlockWorker(String),
     /// Vhost user: {0}
     VhostUser(vhost_user::VhostUserError),
     /// Setting tap interface offload flags failed: {0}

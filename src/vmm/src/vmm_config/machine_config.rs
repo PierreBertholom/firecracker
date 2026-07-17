@@ -20,7 +20,7 @@ pub enum MachineConfigError {
     IncompatibleBalloonSize,
     /// The memory size (MiB) is either 0, or not a multiple of the configured page size.
     InvalidMemorySize,
-    /// The number of vCPUs must be greater than 0, less than {MAX_SUPPORTED_VCPUS:} and must be 1 or an even number if SMT is enabled.
+    /// The number of vCPUs must be greater than 0, less than {MAX_SUPPORTED_VCPUS:}, no lower than the configured block queue count, and must be 1 or an even number if SMT is enabled.
     InvalidVcpuCount,
     /// Could not get the configuration of the previously installed balloon device to validate the memory size.
     InvalidVmState,

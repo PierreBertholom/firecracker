@@ -12,6 +12,7 @@ use crate::VmmError;
 use crate::devices::virtio::block::device::Block;
 pub use crate::devices::virtio::block::virtio::device::FileEngineType;
 use crate::devices::virtio::block::{BlockError, CacheType};
+use crate::devices::virtio::block::virtio::DEFAULT_BLOCK_NUM_QUEUES;
 use crate::devices::virtio::device::VirtioDevice;
 
 /// Errors associated with the operations allowed on a drive.
@@ -25,12 +26,14 @@ pub enum DriveError {
     CreateRateLimiter(io::Error),
     /// Unable to patch the block device: {0} Please verify the request arguments.
     DeviceUpdate(VmmError),
+    /// Invalid queue count {0}; cannot exceed the configured vCPU count {1}.
+    InvalidQueueCount(u16, u8),
     /// A root block device already exists!
     RootBlockDeviceAlreadyAdded,
 }
 
 /// Use this structure to set up the Block Device before booting the kernel.
-#[derive(Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct BlockDeviceConfig {
     /// Unique identifier of the drive.
@@ -55,6 +58,9 @@ pub struct BlockDeviceConfig {
     // default to false
     #[serde(default)]
     pub threaded: bool,
+    /// Number of queues for the device. Cannot exceed the configured vCPU count.
+    #[serde(default = "default_num_queues")]
+    pub num_queues: u16,
     /// Path of the drive.
     pub path_on_host: Option<String>,
     /// Rate Limiter for I/O operations.
@@ -70,6 +76,8 @@ pub struct BlockDeviceConfig {
     /// Path to the vhost-user socket.
     pub socket: Option<String>,
 }
+
+pub(crate) fn default_num_queues() -> u16 { DEFAULT_BLOCK_NUM_QUEUES }
 
 /// Only provided fields will be updated. I.e. if any optional fields
 /// are missing, they will not be updated.
@@ -95,6 +103,36 @@ pub struct BlockBuilder {
     // specified in order to avoid bugs in case of switching from partuuid boot
     // scenarios to /dev/vda boot type.
     pub devices: VecDeque<Arc<Mutex<Block>>>,
+}
+
+impl Default for BlockDeviceConfig {
+    fn default() -> Self {
+        BlockDeviceConfig {
+            drive_id: "".to_string(),
+            partuuid: None,
+            is_root_device: false,
+            cache_type: Default::default(),
+            is_read_only: None,
+            threaded: false,
+            num_queues: DEFAULT_BLOCK_NUM_QUEUES,
+            path_on_host: None,
+            rate_limiter: None,
+            file_engine_type: None,
+            socket: None,
+        }
+    }
+}
+
+impl BlockDeviceConfig {
+    pub(crate) fn validate_num_queues(&self, vcpu_count: u8) -> Result<(), DriveError> {
+        if self.num_queues > u16::from(vcpu_count) {
+            return Err(DriveError::InvalidQueueCount(
+                self.num_queues,
+                vcpu_count,
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl BlockBuilder {
@@ -220,6 +258,7 @@ mod tests {
                 file_engine_type: self.file_engine_type,
 
                 socket: self.socket.clone(),
+                num_queues: self.num_queues,
             }
         }
     }
@@ -243,6 +282,7 @@ mod tests {
 
             is_read_only: Some(false),
             threaded: false,
+            num_queues: 1,
             path_on_host: Some(dummy_path),
             rate_limiter: None,
             file_engine_type: None,
@@ -278,6 +318,7 @@ mod tests {
 
             is_read_only: Some(true),
             threaded: false,
+            num_queues: 1,
             path_on_host: Some(dummy_path),
             rate_limiter: None,
             file_engine_type: None,
@@ -311,6 +352,7 @@ mod tests {
 
             is_read_only: Some(true),
             threaded: false,
+            num_queues: 1,
             path_on_host: Some(dummy_path),
             rate_limiter: None,
             file_engine_type: None,
@@ -341,6 +383,7 @@ mod tests {
 
             is_read_only: Some(false),
             threaded: false,
+            num_queues: 1,
             path_on_host: Some(dummy_path_1),
             rate_limiter: None,
             file_engine_type: None,
@@ -358,6 +401,7 @@ mod tests {
 
             is_read_only: Some(false),
             threaded: false,
+            num_queues: 1,
             path_on_host: Some(dummy_path_2),
             rate_limiter: None,
             file_engine_type: None,
@@ -386,6 +430,7 @@ mod tests {
 
             is_read_only: Some(false),
             threaded: false,
+            num_queues: 1,
             path_on_host: Some(dummy_path_1),
             rate_limiter: None,
             file_engine_type: None,
@@ -403,6 +448,7 @@ mod tests {
 
             is_read_only: Some(false),
             threaded: false,
+            num_queues: 1,
             path_on_host: Some(dummy_path_2),
             rate_limiter: None,
             file_engine_type: None,
@@ -420,6 +466,7 @@ mod tests {
 
             is_read_only: Some(false),
             threaded: false,
+            num_queues: 1,
             path_on_host: Some(dummy_path_3),
             rate_limiter: None,
             file_engine_type: None,
@@ -462,6 +509,7 @@ mod tests {
 
             is_read_only: Some(false),
             threaded: false,
+            num_queues: 1,
             path_on_host: Some(dummy_path_1),
             rate_limiter: None,
             file_engine_type: None,
@@ -479,6 +527,7 @@ mod tests {
 
             is_read_only: Some(false),
             threaded: false,
+            num_queues: 1,
             path_on_host: Some(dummy_path_2),
             rate_limiter: None,
             file_engine_type: None,
@@ -496,6 +545,7 @@ mod tests {
 
             is_read_only: Some(false),
             threaded: false,
+            num_queues: 1,
             path_on_host: Some(dummy_path_3),
             rate_limiter: None,
             file_engine_type: None,
@@ -539,6 +589,7 @@ mod tests {
 
             is_read_only: Some(false),
             threaded: false,
+            num_queues: 1,
             path_on_host: Some(dummy_path_1.clone()),
             rate_limiter: None,
             file_engine_type: None,
@@ -556,6 +607,7 @@ mod tests {
 
             is_read_only: Some(false),
             threaded: false,
+            num_queues: 1,
             path_on_host: Some(dummy_path_2.clone()),
             rate_limiter: None,
             file_engine_type: None,
@@ -629,6 +681,7 @@ mod tests {
 
             is_read_only: Some(false),
             threaded: false,
+            num_queues: 1,
             path_on_host: Some(dummy_path_1),
             rate_limiter: None,
             file_engine_type: None,
@@ -646,6 +699,7 @@ mod tests {
 
             is_read_only: Some(false),
             threaded: false,
+            num_queues: 1,
             path_on_host: Some(dummy_path_2),
             rate_limiter: None,
             file_engine_type: None,
@@ -673,6 +727,7 @@ mod tests {
 
             is_read_only: Some(true),
             threaded: false,
+            num_queues: 1,
             path_on_host: Some(dummy_file.as_path().to_str().unwrap().to_string()),
             rate_limiter: None,
             file_engine_type: Some(FileEngineType::Sync),
@@ -691,6 +746,35 @@ mod tests {
     }
 
     #[test]
+    fn test_default_block_config() {
+        let minimal_json = r#"
+            {
+            "drive_id": "test_id",
+            "is_root_device": true
+            }
+        "#;
+
+        let override_num_queues = r#"
+            {
+            "drive_id": "test_id",
+            "is_root_device": true,
+            "num_queues":4
+            }
+        "#;
+
+        let minimal_config_parsed: BlockDeviceConfig = serde_json::from_str(minimal_json).unwrap();
+        let override_num_queues_parsed: BlockDeviceConfig =
+            serde_json::from_str(override_num_queues).unwrap();
+
+        assert_eq!(minimal_config_parsed.num_queues, DEFAULT_BLOCK_NUM_QUEUES);
+        assert_eq!(
+            minimal_config_parsed.num_queues,
+            BlockDeviceConfig::default().num_queues
+        );
+        assert_eq!(override_num_queues_parsed.num_queues, 4);
+    }
+
+    #[test]
     fn test_add_device() {
         let mut block_devs = BlockBuilder::new();
         let backing_file = TempFile::new().unwrap();
@@ -704,6 +788,7 @@ mod tests {
 
             is_read_only: Some(true),
             threaded: false,
+            num_queues: 1,
             path_on_host: Some(backing_file.as_path().to_str().unwrap().to_string()),
             rate_limiter: None,
             file_engine_type: None,

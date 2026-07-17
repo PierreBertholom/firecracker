@@ -270,7 +270,7 @@ pub enum TokenType {
 }
 
 /// Enum that describes the type of token bucket update.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub enum BucketUpdate {
     /// No Update - same as before.
     None,

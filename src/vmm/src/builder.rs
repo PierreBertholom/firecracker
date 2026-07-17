@@ -893,6 +893,7 @@ pub(crate) mod tests {
 
                 is_read_only: Some(custom_block_cfg.is_read_only),
                 threaded: false,
+                num_queues: 1,
                 path_on_host: Some(
                     block_files
                         .last()

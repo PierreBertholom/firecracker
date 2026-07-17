@@ -23,7 +23,7 @@ use crate::devices::virtio::block::CacheType;
 use crate::devices::virtio::block::virtio::io::{async_io, FileEngine};
 use crate::devices::virtio::block::virtio::persist::FileEngineTypeState;
 use crate::devices::virtio::persist::QueueState;
-use crate::devices::virtio::queue::{InvalidAvailIdx, Queue, QueueError};
+use crate::devices::virtio::queue::{InvalidAvailIdx, QueueError};
 use crate::devices::virtio::transport::VirtioInterruptType;
 use crate::logger::{IncMetric, error, warn};
 use crate::rate_limiter::persist::RateLimiterState;
@@ -48,7 +48,7 @@ pub(crate) struct ThreadedWorker {
 }
 
 pub(crate) struct SavedState {
-    pub queue_state: Vec<QueueState>,
+    pub queue_state: QueueState,
     pub rate_limiter_state: RateLimiterState,
     pub disk_path: String,
     pub file_engine_type: FileEngineTypeState,
@@ -62,6 +62,7 @@ enum WorkerState {
     Finished,
 }
 
+#[derive(Clone, Copy)]
 pub(crate) enum FlushMode {
     Drain,
     DrainAndFlush,
@@ -95,7 +96,7 @@ pub(crate) struct WorkerHandle {
     receiver_rx: Receiver<ControlResponse>,
     control_evt: EventFd,
     join: JoinHandle<()>,
-    queue_evts: Vec<EventFd>,
+    queue_evt: EventFd,
 }
 macro_rules! unwrap_async_file_engine_or_return {
     ($file_engine: expr) => {
@@ -112,7 +113,7 @@ macro_rules! unwrap_async_file_engine_or_return {
 impl WorkerHandle {
     pub(crate) fn spawn(
         seccomp_filter: Arc<BpfProgram>,
-        queue_evts: Vec<EventFd>,
+        queue_evt: EventFd,
     ) -> Result<WorkerHandle, std::io::Error> {
         // One kick eventfd, shared between worker (registers on its epoll) and shell (writes to
         // wake it). Both refer to the same kernel object via try_clone.
@@ -140,20 +141,19 @@ impl WorkerHandle {
             receiver_rx,
             control_evt: handle_evt,
             join,
-            queue_evts,
+            queue_evt,
         })
     }
 
-    pub(crate) fn queue_events(&self) -> &[EventFd] { &self.queue_evts }
+    pub(crate) fn queue_event(&self) -> &EventFd { &self.queue_evt }
 
-    pub(crate) fn start(&self, worker: BlockWorker) {
-        if let Err(e) = self.control_tx.send(ControlMsg::Start(worker)) {
-            error!("Failed to send start message: {:?}", e);
-        }
-
-        if let Err(e) = self.control_evt.write(1) {
-            error!("Failed to notify worker: {:?}", e);
-        }
+    pub(crate) fn start(&self, worker: BlockWorker) -> Result<(), ActivateError> {
+        self.control_tx
+            .send(ControlMsg::Start(worker))
+            .map_err(|err| ActivateError::BlockWorker(err.to_string()))?;
+        self.control_evt
+            .write(1)
+            .map_err(|err| ActivateError::BlockWorker(err.to_string()))
     }
 
     pub(crate) fn finish(self, flush_mode: FlushMode) {
@@ -360,21 +360,18 @@ impl WorkerHandle {
 impl BlockResources {
     pub(crate) fn reset_for_reactivation(&mut self) {
         self.is_io_engine_throttled = false;
-        for queue in self.queues.iter_mut() {
-            queue.reset();
-        }
+        self.queue.reset();
     }
 }
 
 impl BlockWorker {
-
     /// Process a single event in the Virtio queue.
     ///
     /// This function is called by the event manager when the guest notifies us
     /// about new buffers in the queue.
     pub(crate) fn process_queue_event(&mut self) {
         self.metrics.queue_event_count.inc();
-        if let Err(err) = self.resources.queue_evts[0].read() {
+        if let Err(err) = self.resources.queue_evt.read() {
             error!("Failed to get queue event: {:?}", err);
             self.metrics.event_fails.inc();
         } else if self.resources.rate_limiter.is_blocked() {
@@ -388,7 +385,7 @@ impl BlockWorker {
 
     /// Process device virtio queue(s).
     pub(crate) fn process_virtio_queues(&mut self) -> Result<(), InvalidAvailIdx> {
-        self.process_queue(0)
+        self.process_queue()
     }
 
     pub(crate) fn process_rate_limiter_event(&mut self) {
@@ -396,13 +393,13 @@ impl BlockWorker {
         // Upon rate limiter event, call the rate limiter handler
         // and restart processing the queue.
         if self.resources.rate_limiter.event_handler().is_ok() {
-            self.process_queue(0).unwrap()
+            self.process_queue().unwrap()
         }
     }
 
     /// Device specific function for peaking inside a queue and processing descriptors.
-    fn process_queue(&mut self, queue_index: usize) -> Result<(), InvalidAvailIdx> {
-        let queue = &mut self.resources.queues[queue_index];
+    fn process_queue(&mut self) -> Result<(), InvalidAvailIdx> {
+        let queue = &mut self.resources.queue;
         let mut used_any = false;
 
         while let Some(head) = queue.pop_or_enable_notification()? {
@@ -460,7 +457,7 @@ impl BlockWorker {
         if used_any && queue.prepare_kick() {
             self.active_state
                 .interrupt
-                .trigger(VirtioInterruptType::Queue(0))
+                .trigger(VirtioInterruptType::Queue(self.resources.queue_index))
                 .unwrap_or_else(|_| {
                     self.metrics.event_fails.inc();
                 });
@@ -481,7 +478,7 @@ impl BlockWorker {
 
     fn process_async_completion_queue(&mut self) {
         let engine = unwrap_async_file_engine_or_return!(&mut self.resources.disk.file_engine);
-        let queue = &mut self.resources.queues[0];
+        let queue = &mut self.resources.queue;
 
         loop {
             match engine.pop(&self.active_state.mem) {
@@ -520,7 +517,7 @@ impl BlockWorker {
         if queue.prepare_kick() {
             self.active_state
                 .interrupt
-                .trigger(VirtioInterruptType::Queue(0))
+                .trigger(VirtioInterruptType::Queue(self.resources.queue_index))
                 .unwrap_or_else(|_| {
                     self.metrics.event_fails.inc();
                 });
@@ -537,7 +534,7 @@ impl BlockWorker {
 
             if self.resources.is_io_engine_throttled {
                 self.resources.is_io_engine_throttled = false;
-                self.process_queue(0).unwrap()
+                self.process_queue().unwrap()
             }
         }
     }
@@ -591,7 +588,7 @@ impl ThreadedWorker {
 
     fn register_runtime_events(resources: &BlockResources, ops: &mut EventOps) {
         if let Err(err) = ops.add(Events::with_data(
-            &resources.queue_evts[0],
+            &resources.queue_evt,
             Self::PROCESS_QUEUE,
             EventSet::IN,
         )) {
@@ -617,7 +614,7 @@ impl ThreadedWorker {
 
     fn unregister_runtime_events(resources: &BlockResources, ops: &mut EventOps) {
         if let Err(err) = ops.remove(Events::with_data(
-            &resources.queue_evts[0],
+            &resources.queue_evt,
             Self::PROCESS_QUEUE,
             EventSet::IN,
         )) {
@@ -699,7 +696,7 @@ impl ThreadedWorker {
             ControlMsg::GetSavedState => {
                 if let WorkerState::Paused(worker) | WorkerState::Running(worker) = &self.state {
                     let saved_state = SavedState {
-                        queue_state: worker.resources.queues.iter().map(Persist::save).collect(),
+                        queue_state: worker.resources.queue.save(),
                         rate_limiter_state: worker.resources.rate_limiter.save(),
                         disk_path: worker.resources.disk.file_path.clone(),
                         file_engine_type: match worker.resources.disk.file_engine {
@@ -716,12 +713,9 @@ impl ThreadedWorker {
                 let mut result = Ok(());
                 if let WorkerState::Paused(worker) = &mut self.state {
                     let mem = worker.active_state.mem.clone();
-                    for queue in worker.resources.queues.iter_mut() {
-                        // mark them dirty for next snapshot
-                        if let Err(e) = queue.initialize(&mem) {
-                            result = Err(e);
-                            break;
-                        }
+                    // Mark dirty for the next snapshot.
+                    if let Err(e) = worker.resources.queue.initialize(&mem) {
+                        result = Err(e);
                     }
                 }
                 let _ = self.response_tx.send(ControlResponse::QMemDirty(result));

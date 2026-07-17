@@ -193,7 +193,7 @@ impl MMIODeviceManager {
             for i in 0..locked_device.num_queues() {
                 let queue_evt = locked_device
                     .queue_event(i)
-                    .expect("queue event must exist for each advertised queue");
+                    .expect("queue event must exist for each queue");
                 let io_addr = IoEventAddress::Mmio(
                     device.resources.addr + u64::from(crate::devices::virtio::NOTIFY_REG_OFFSET),
                 );

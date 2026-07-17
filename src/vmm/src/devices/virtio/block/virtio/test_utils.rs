@@ -44,6 +44,7 @@ pub fn default_block_with_path(path: String, file_engine_type: FileEngineType) -
         partuuid: None,
         is_read_only: false,
         threaded: false,
+        num_queues: 1,
         cache_type: CacheType::Unsafe,
         // Rate limiting is enabled but with a high operation rate (10 million ops/s).
         rate_limiter: Some(RateLimiterConfig {
@@ -65,9 +66,13 @@ pub fn default_block_with_path(path: String, file_engine_type: FileEngineType) -
     VirtioBlock::new(config).unwrap()
 }
 
-pub fn set_queue(blk: &mut VirtioBlock, idx: usize, q: Queue) { blk.resources_mut().queues[idx] = q; }
+pub fn set_queue(blk: &mut VirtioBlock, idx: usize, q: Queue) {
+    blk.resources_mut()[idx].queue = q;
+}
 
-pub fn set_rate_limiter(blk: &mut VirtioBlock, rl: RateLimiter) { blk.resources_mut().rate_limiter = rl; }
+pub fn set_rate_limiter(blk: &mut VirtioBlock, rl: RateLimiter) {
+    blk.resources_mut()[0].rate_limiter = rl;
+}
 
 pub fn rate_limiter(blk: &mut VirtioBlock) -> &RateLimiter { blk.rate_limiter() }
 
@@ -90,7 +95,7 @@ pub fn simulate_queue_event(b: &mut VirtioBlock, maybe_expected_irq: Option<bool
 
 #[cfg(test)]
 pub fn simulate_async_completion_event(b: &mut VirtioBlock, expected_irq: bool) {
-    if let FileEngine::Async(ref mut engine) = b.resources_mut().disk.file_engine {
+    if let FileEngine::Async(ref mut engine) = b.resources_mut()[0].disk.file_engine {
         // Wait for all the async operations to complete.
         engine.drain(false).unwrap();
         // Wait for the async completion event to be sent.

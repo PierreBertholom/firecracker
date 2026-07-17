@@ -716,6 +716,9 @@ impl Vmm {
             .as_kvm()
             .ok_or_else(|| VmmActionError::NotSupported("Operation requires KVM".to_string()))?
             .clone();
+        if let HotplugDeviceConfig::Block(block_config) = &config {
+            block_config.validate_num_queues(self.machine_config.vcpu_count)?;
+        }
         self.device_manager
             .hotplug_device(kvm_vm, config, event_manager, seccomp_filters)
     }
