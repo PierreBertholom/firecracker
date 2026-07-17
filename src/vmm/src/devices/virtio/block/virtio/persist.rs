@@ -3,9 +3,9 @@
 
 //! Defines the structures needed for saving/restoring block devices.
 
-use std::sync::Arc;
 use device::ConfigSpace;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use vmm_sys_util::eventfd::EventFd;
 
 use super::device::{ActiveBlock, BlockResources, BlockState, DiskProperties};
@@ -86,14 +86,14 @@ impl Persist<'_> for VirtioBlock {
                         acked_features: self.acked_features,
                         queues: st.queue_state,
                         activated: true,
-                    }
+                    },
                 )
             } else {
                 (
-                 self.disk().file_path.clone(),
-                 self.rate_limiter().save(),
-                 FileEngineTypeState::from(self.file_engine_type()),
-                 VirtioDeviceState::from_device(self),
+                    self.disk().file_path.clone(),
+                    self.rate_limiter().save(),
+                    FileEngineTypeState::from(self.file_engine_type()),
+                    VirtioDeviceState::from_device(self),
                 )
             };
 
@@ -148,7 +148,7 @@ impl Persist<'_> for VirtioBlock {
             queue_evts,
             disk: disk_properties,
             rate_limiter,
-            is_io_engine_throttled: false
+            is_io_engine_throttled: false,
         };
 
         Ok(VirtioBlock {

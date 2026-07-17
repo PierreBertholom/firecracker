@@ -766,19 +766,31 @@ impl RuntimeApiController {
                 .vmm
                 .lock()
                 .expect("Poisoned lock")
-                .hotplug_device(HotplugDeviceConfig::Block(config), event_manager, &self.seccomp_filters)
+                .hotplug_device(
+                    HotplugDeviceConfig::Block(config),
+                    event_manager,
+                    &self.seccomp_filters,
+                )
                 .map(|()| VmmData::Empty),
             InsertPmemDevice(config) => self
                 .vmm
                 .lock()
                 .expect("Poisoned lock")
-                .hotplug_device(HotplugDeviceConfig::Pmem(config), event_manager, &self.seccomp_filters)
+                .hotplug_device(
+                    HotplugDeviceConfig::Pmem(config),
+                    event_manager,
+                    &self.seccomp_filters,
+                )
                 .map(|()| VmmData::Empty),
             InsertNetworkDevice(config) => self
                 .vmm
                 .lock()
                 .expect("Poisoned lock")
-                .hotplug_device(HotplugDeviceConfig::Net(config), event_manager, &self.seccomp_filters)
+                .hotplug_device(
+                    HotplugDeviceConfig::Net(config),
+                    event_manager,
+                    &self.seccomp_filters,
+                )
                 .map(|()| VmmData::Empty),
             HotUnplugDevice(device_id) => self
                 .vmm
@@ -864,7 +876,10 @@ impl RuntimeApiController {
 
     /// Creates a new `RuntimeApiController`.
     pub fn new(vmm: Arc<Mutex<Vmm>>, seccomp_filters: &BpfThreadMap) -> Self {
-        Self { vmm, seccomp_filters: seccomp_filters.clone(), }
+        Self {
+            vmm,
+            seccomp_filters: seccomp_filters.clone(),
+        }
     }
 
     /// Pauses the microVM by pausing the vCPUs.

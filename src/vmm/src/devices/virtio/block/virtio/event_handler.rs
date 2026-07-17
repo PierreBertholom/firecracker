@@ -30,7 +30,6 @@ impl MutEventSubscriber for VirtioBlock {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, Mutex};

@@ -485,7 +485,8 @@ impl<'a> Persist<'a> for MMIOVirtioDevices {
             {
                 let mut blk = device.lock().expect("Poisoned lock");
                 blk.set_worker_filter(
-                    constructor_args.seccomp_filters
+                    constructor_args
+                        .seccomp_filters
                         .get("blk_worker")
                         .expect("Missing blk_worker seccomp filter")
                         .clone(),

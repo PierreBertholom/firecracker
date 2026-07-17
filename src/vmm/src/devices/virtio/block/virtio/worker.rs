@@ -5,31 +5,33 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the THIRD-PARTY file.
 
-use std::sync::{Arc, Mutex};
-use std::sync::mpsc::{Receiver, Sender, channel};
-use std::thread::{self, JoinHandle};
-use event_manager::{EventOps, Events, MutEventSubscriber, SubscriberOps};
 use crate::EventManager;
-use crate::devices::virtio::block::virtio::device::BlockResources;
-use crate::devices::virtio::block::virtio::metrics::BlockDeviceMetrics;
-use crate::devices::virtio::block::virtio::{FinishedRequest, IoErr, ProcessingResult, Request, VirtioBlockError};
-use crate::devices::virtio::device::ActiveState;
-use crate::rate_limiter::BucketUpdate;
-use crate::seccomp::{BpfProgram, apply_filter};
-use vmm_sys_util::epoll::EventSet;
-use vmm_sys_util::eventfd::EventFd;
 use crate::devices::virtio::ActivateError;
 use crate::devices::virtio::block::CacheType;
-use crate::devices::virtio::block::virtio::io::{async_io, FileEngine};
+use crate::devices::virtio::block::virtio::device::BlockResources;
+use crate::devices::virtio::block::virtio::io::{FileEngine, async_io};
+use crate::devices::virtio::block::virtio::metrics::BlockDeviceMetrics;
 use crate::devices::virtio::block::virtio::persist::FileEngineTypeState;
+use crate::devices::virtio::block::virtio::{
+    FinishedRequest, IoErr, ProcessingResult, Request, VirtioBlockError,
+};
+use crate::devices::virtio::device::ActiveState;
 use crate::devices::virtio::persist::QueueState;
 use crate::devices::virtio::queue::{InvalidAvailIdx, Queue, QueueError};
 use crate::devices::virtio::transport::VirtioInterruptType;
 use crate::logger::{IncMetric, error, warn};
+use crate::rate_limiter::BucketUpdate;
 use crate::rate_limiter::persist::RateLimiterState;
+use crate::seccomp::{BpfProgram, apply_filter};
 use crate::snapshot::Persist;
 use crate::vmm_config::drive::FileEngineType;
 use crate::vstate::memory::GuestMemoryMmap;
+use event_manager::{EventOps, Events, MutEventSubscriber, SubscriberOps};
+use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::{Arc, Mutex};
+use std::thread::{self, JoinHandle};
+use vmm_sys_util::epoll::EventSet;
+use vmm_sys_util::eventfd::EventFd;
 
 /// Worker block device data
 #[derive(Debug)]
@@ -83,7 +85,7 @@ enum ControlMsg {
 #[allow(clippy::large_enum_variant)]
 enum ControlResponse {
     DiskUpdated(Result<u64, VirtioBlockError>), // nsectors / error
-    Paused, // ACK
+    Paused,                                     // ACK
     SaveReady(SavedState),
     QMemDirty(Result<(), QueueError>),
     Reset(Option<BlockResources>),
@@ -126,8 +128,8 @@ impl WorkerHandle {
             .name("fc_blk_worker".to_owned())
             .spawn(move || {
                 // epoll first (not in seccomp), then register, then lock down.
-                let event_manager = EventManager::new()
-                    .expect("Failed to create block worker EventManager");
+                let event_manager =
+                    EventManager::new().expect("Failed to create block worker EventManager");
 
                 if let Err(err) = apply_filter(&seccomp_filter) {
                     panic!("Failed to apply seccomp filter on block worker: {err}");
@@ -144,7 +146,9 @@ impl WorkerHandle {
         })
     }
 
-    pub(crate) fn queue_events(&self) -> &[EventFd] { &self.queue_evts }
+    pub(crate) fn queue_events(&self) -> &[EventFd] {
+        &self.queue_evts
+    }
 
     pub(crate) fn start(&self, worker: BlockWorker) {
         if let Err(e) = self.control_tx.send(ControlMsg::Start(worker)) {
@@ -192,7 +196,9 @@ impl WorkerHandle {
                     warn!("Ignoring reset response while waiting for pause");
                 }
                 Ok(ControlResponse::QMemDirty(_)) => {
-                    warn!("Ignoring marking queue memory dirty response while waiting for disk update");
+                    warn!(
+                        "Ignoring marking queue memory dirty response while waiting for disk update"
+                    );
                 }
                 Err(e) => {
                     error!("Block worker failed to acknowledge pause: {:?}", e);
@@ -223,7 +229,9 @@ impl WorkerHandle {
                     warn!("Ignoring reset response while waiting for saved state");
                 }
                 Ok(ControlResponse::QMemDirty(_)) => {
-                    warn!("Ignoring marking queue memory dirty response while waiting for disk update");
+                    warn!(
+                        "Ignoring marking queue memory dirty response while waiting for disk update"
+                    );
                 }
                 Err(e) => {
                     error!("Block worker failed to acknowledge saved state: {:?}", e);
@@ -245,7 +253,7 @@ impl WorkerHandle {
                 Ok(ControlResponse::QMemDirty(r)) => return r,
                 Ok(ControlResponse::SaveReady(_)) => {
                     warn!("Ignoring saved state response while waiting for pause");
-                },
+                }
                 Ok(ControlResponse::DiskUpdated(_)) => {
                     warn!("Ignoring disk update response while waiting for saved state");
                 }
@@ -286,7 +294,9 @@ impl WorkerHandle {
                     warn!("Ignoring saved state response while waiting for reset");
                 }
                 Ok(ControlResponse::QMemDirty(_)) => {
-                    warn!("Ignoring marking queue memory dirty response while waiting for disk update");
+                    warn!(
+                        "Ignoring marking queue memory dirty response while waiting for disk update"
+                    );
                 }
                 Err(e) => {
                     error!("Block worker failed to acknowledge reset: {:?}", e);
@@ -296,8 +306,15 @@ impl WorkerHandle {
         }
     }
 
-    pub(crate) fn update_disk_image(&self, disk_image_path: String, read_only: bool) -> Result<u64, VirtioBlockError> {
-        if let Err(e) = self.control_tx.send(ControlMsg::UpdateDiskImage(disk_image_path, read_only)) {
+    pub(crate) fn update_disk_image(
+        &self,
+        disk_image_path: String,
+        read_only: bool,
+    ) -> Result<u64, VirtioBlockError> {
+        if let Err(e) = self
+            .control_tx
+            .send(ControlMsg::UpdateDiskImage(disk_image_path, read_only))
+        {
             error!("Failed to send disk update message: {:?}", e);
             return Err(VirtioBlockError::WorkerControl(format!(
                 "failed to send disk update request: {e}"
@@ -324,7 +341,9 @@ impl WorkerHandle {
                     warn!("Ignoring reset response while waiting for disk update");
                 }
                 Ok(ControlResponse::QMemDirty(_)) => {
-                    warn!("Ignoring marking queue memory dirty response while waiting for disk update");
+                    warn!(
+                        "Ignoring marking queue memory dirty response while waiting for disk update"
+                    );
                 }
                 Err(e) => {
                     error!("Block worker failed to acknowledge disk update: {:?}", e);
@@ -347,12 +366,18 @@ impl WorkerHandle {
     }
 
     pub(crate) fn update_rate_limiter(&self, bytes: BucketUpdate, ops_update: BucketUpdate) {
-        if let Err(e) = self.control_tx.send(ControlMsg::UpdateRateLimiter(bytes, ops_update)) {
+        if let Err(e) = self
+            .control_tx
+            .send(ControlMsg::UpdateRateLimiter(bytes, ops_update))
+        {
             error!("Block receiver dropped on rate limiter update: {:?}", e);
         }
 
         if let Err(e) = self.control_evt.write(1) {
-            error!("Block control event is closed on rate limiter update: {:?}", e);
+            error!(
+                "Block control event is closed on rate limiter update: {:?}",
+                e
+            );
         }
     }
 }
@@ -367,7 +392,6 @@ impl BlockResources {
 }
 
 impl BlockWorker {
-
     /// Process a single event in the Virtio queue.
     ///
     /// This function is called by the event manager when the guest notifies us
@@ -498,9 +522,11 @@ impl BlockWorker {
                         Ok(count) => (user_data, Ok(count)),
                         Err(error) => (
                             user_data,
-                            Err(IoErr::FileEngine(crate::devices::virtio::block::virtio::io::BlockIoError::Async(
-                                async_io::AsyncIoError::IO(error),
-                            ))),
+                            Err(IoErr::FileEngine(
+                                crate::devices::virtio::block::virtio::io::BlockIoError::Async(
+                                    async_io::AsyncIoError::IO(error),
+                                ),
+                            )),
                         ),
                     };
                     let finished = pending.finish(&self.active_state.mem, res, &self.metrics);
@@ -562,7 +588,11 @@ impl BlockWorker {
     }
 
     /// Update the backing file and return the new sector count.
-    pub fn update_disk_image(&mut self, disk_image_path: String, read_only: bool) -> Result<u64, VirtioBlockError> {
+    pub fn update_disk_image(
+        &mut self,
+        disk_image_path: String,
+        read_only: bool,
+    ) -> Result<u64, VirtioBlockError> {
         self.resources.disk.update(disk_image_path, read_only)?;
         Ok(self.resources.disk.nsectors)
     }
@@ -686,7 +716,7 @@ impl ThreadedWorker {
             ControlMsg::Reset => self.reset_worker(ops),
             ControlMsg::Kick => {
                 if matches!(self.state, WorkerState::Paused(_)) {
-                self.resume_worker(ops);
+                    self.resume_worker(ops);
                 }
                 // process directly instead of going through epoll (regular kick)
                 if let WorkerState::Running(worker) = &mut self.state {
@@ -707,7 +737,10 @@ impl ThreadedWorker {
                             FileEngine::Sync(_) => FileEngineTypeState::Sync,
                         },
                     };
-                    if let Err(err) = self.response_tx.send(ControlResponse::SaveReady(saved_state)) {
+                    if let Err(err) = self
+                        .response_tx
+                        .send(ControlResponse::SaveReady(saved_state))
+                    {
                         error!("Failed to send DiskUpdated ACK: {:?}", err);
                     }
                 }
@@ -744,13 +777,15 @@ impl ThreadedWorker {
             WorkerState::Running(mut worker) => {
                 Self::unregister_runtime_events(&worker.resources, ops);
                 worker.prepare_save();
-                if let Err(err) = self.response_tx.send(ControlResponse::Paused)
-                { error!("Failed to send Paused ACK: {:?}", err); }
+                if let Err(err) = self.response_tx.send(ControlResponse::Paused) {
+                    error!("Failed to send Paused ACK: {:?}", err);
+                }
                 self.state = WorkerState::Paused(worker);
             }
             WorkerState::Paused(worker) => {
-                if let Err(err) = self.response_tx.send(ControlResponse::Paused)
-                { error!("Failed to send Paused ACK: {:?}", err); }
+                if let Err(err) = self.response_tx.send(ControlResponse::Paused) {
+                    error!("Failed to send Paused ACK: {:?}", err);
+                }
                 self.state = WorkerState::Paused(worker);
             }
             other => {
@@ -782,7 +817,9 @@ impl ThreadedWorker {
                 if let Err(err) = self
                     .response_tx
                     .send(ControlResponse::Reset(Some(worker.resources)))
-                { error!("Failed to send Reset ACK: {:?}", err); }
+                {
+                    error!("Failed to send Reset ACK: {:?}", err);
+                }
             }
             WorkerState::Paused(mut worker) => {
                 worker.drain(true);
@@ -790,12 +827,15 @@ impl ThreadedWorker {
                 if let Err(err) = self
                     .response_tx
                     .send(ControlResponse::Reset(Some(worker.resources)))
-                { error!("Failed to send Reset ACK: {:?}", err); }
+                {
+                    error!("Failed to send Reset ACK: {:?}", err);
+                }
             }
             WorkerState::Parked => {
                 warn!("Reset requested while block worker is parked");
-                if let Err(err) = self.response_tx.send(ControlResponse::Reset(None))
-                { error!("Failed to send Reset ACK: {:?}", err); }
+                if let Err(err) = self.response_tx.send(ControlResponse::Reset(None)) {
+                    error!("Failed to send Reset ACK: {:?}", err);
+                }
             }
             WorkerState::Finished => {
                 self.state = WorkerState::Finished;
@@ -856,7 +896,11 @@ fn run_worker_loop(
         if let Err(err) = event_manager.run() {
             error!("Block worker event loop error: {:?}", err);
         }
-        if worker.lock().expect("Poisoned block worker lock").is_finished() {
+        if worker
+            .lock()
+            .expect("Poisoned block worker lock")
+            .is_finished()
+        {
             break;
         }
     }
@@ -898,10 +942,12 @@ impl MutEventSubscriber for ThreadedWorker {
         } else {
             match source {
                 Self::PROCESS_CONTROL => self.process_control_event(ops),
-                _ => warn!("Block: The device worker is not yet activated. Spurious event received: {:?}",source),
+                _ => warn!(
+                    "Block: The device worker is not yet activated. Spurious event received: {:?}",
+                    source
+                ),
             }
         }
-
     }
 
     fn init(&mut self, ops: &mut EventOps) {

@@ -947,7 +947,8 @@ pub(crate) mod tests {
 
         // Successful case
         let cfg = HotplugDeviceConfig::Block(make_hotplug_block_cfg("block0", &f, false));
-        vmm.hotplug_device(cfg, &mut evt_manager, &seccomp_filters).unwrap();
+        vmm.hotplug_device(cfg, &mut evt_manager, &seccomp_filters)
+            .unwrap();
         assert!(
             pci_devices(&vmm.device_manager)
                 .virtio_devices
@@ -1042,7 +1043,8 @@ pub(crate) mod tests {
             read_only: false,
             ..Default::default()
         });
-        vmm.hotplug_device(cfg, &mut evt_manager, &seccomp_filters).unwrap();
+        vmm.hotplug_device(cfg, &mut evt_manager, &seccomp_filters)
+            .unwrap();
         assert!(
             pci_devices(&vmm.device_manager)
                 .virtio_devices
@@ -1100,7 +1102,8 @@ pub(crate) mod tests {
             rx_rate_limiter: None,
             tx_rate_limiter: None,
         });
-        vmm.hotplug_device(cfg, &mut evt_manager, &seccomp_filters).unwrap();
+        vmm.hotplug_device(cfg, &mut evt_manager, &seccomp_filters)
+            .unwrap();
         assert!(
             pci_devices(&vmm.device_manager)
                 .virtio_devices

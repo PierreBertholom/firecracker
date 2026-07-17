@@ -123,7 +123,6 @@ impl Block {
             Self::VhostUser(_) => (),
         }
     }
-
 }
 
 impl VirtioDevice for Block {
@@ -260,10 +259,10 @@ impl VirtioDevice for Block {
         }
     }
 
-    fn spawn_worker(&mut self) -> Result<(), VirtioBlockError>{
+    fn spawn_worker(&mut self) -> Result<(), VirtioBlockError> {
         match self {
             Self::Virtio(b) => b.spawn_worker(),
-            Self::VhostUser(_) => Ok(())
+            Self::VhostUser(_) => Ok(()),
         }
     }
 }

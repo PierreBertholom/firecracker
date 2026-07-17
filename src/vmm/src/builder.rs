@@ -30,6 +30,7 @@ use crate::device_manager::{
 };
 use crate::devices::virtio::balloon::Balloon;
 use crate::devices::virtio::block::device::Block;
+use crate::devices::virtio::block::virtio::VirtioBlockError;
 use crate::devices::virtio::device::VirtioDevice;
 use crate::devices::virtio::mem::{VIRTIO_MEM_DEFAULT_SLOT_SIZE_MIB, VirtioMem};
 use crate::devices::virtio::net::Net;
@@ -61,7 +62,6 @@ use crate::vstate::resources::ResourceAllocator;
 use crate::vstate::vcpu::VcpuError;
 use crate::vstate::vm::{KvmVm, Vm, VmError};
 use crate::{EventManager, Vmm, VmmError};
-use crate::devices::virtio::block::virtio::VirtioBlockError;
 
 /// Errors associated with starting the instance.
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
@@ -680,12 +680,11 @@ fn attach_block_devices<'a, I: Iterator<Item = &'a Arc<Mutex<Block>>> + Debug>(
         };
         {
             let mut blk_lock = block.lock().expect("Poisoned lock");
-            blk_lock
-                .set_worker_filter(
-                    seccomp_filters
-                        .get("blk_worker")
-                        .expect("Missing blk_worker seccomp filter")
-                        .clone(),
+            blk_lock.set_worker_filter(
+                seccomp_filters
+                    .get("blk_worker")
+                    .expect("Missing blk_worker seccomp filter")
+                    .clone(),
             );
             blk_lock
                 .spawn_worker()

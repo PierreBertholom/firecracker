@@ -65,11 +65,17 @@ pub fn default_block_with_path(path: String, file_engine_type: FileEngineType) -
     VirtioBlock::new(config).unwrap()
 }
 
-pub fn set_queue(blk: &mut VirtioBlock, idx: usize, q: Queue) { blk.resources_mut().queues[idx] = q; }
+pub fn set_queue(blk: &mut VirtioBlock, idx: usize, q: Queue) {
+    blk.resources_mut().queues[idx] = q;
+}
 
-pub fn set_rate_limiter(blk: &mut VirtioBlock, rl: RateLimiter) { blk.resources_mut().rate_limiter = rl; }
+pub fn set_rate_limiter(blk: &mut VirtioBlock, rl: RateLimiter) {
+    blk.resources_mut().rate_limiter = rl;
+}
 
-pub fn rate_limiter(blk: &mut VirtioBlock) -> &RateLimiter { blk.rate_limiter() }
+pub fn rate_limiter(blk: &mut VirtioBlock) -> &RateLimiter {
+    blk.rate_limiter()
+}
 
 #[cfg(test)]
 pub fn simulate_queue_event(b: &mut VirtioBlock, maybe_expected_irq: Option<bool>) {

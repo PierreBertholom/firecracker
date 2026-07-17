@@ -263,7 +263,14 @@ pub(crate) fn run_with_api(
             .expect("Poisoned lock")
             .start(super::metrics::WRITE_METRICS_PERIOD_MS);
 
-        ApiServerAdapter::run_microvm(api_event_fd, from_api, to_api, vmm, &mut event_manager, seccomp_filters)
+        ApiServerAdapter::run_microvm(
+            api_event_fd,
+            from_api,
+            to_api,
+            vmm,
+            &mut event_manager,
+            seccomp_filters,
+        )
     });
 
     api_kill_switch.write(1).unwrap();
