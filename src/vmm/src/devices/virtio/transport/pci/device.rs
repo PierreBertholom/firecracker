@@ -1023,9 +1023,9 @@ impl PciDevice for VirtioPciDevice {
 
                     // A queue notification may have arrived after the guest set DRIVER_OK but
                     // before the device finished activating, in which case it was discarded as
-                    // spurious. Kick the device so any buffers the guest already made available
-                    // get processed.
-                    locked_device.kick();
+                    // spurious. Re-notify the queues so any buffers the guest already made
+                    // available get processed.
+                    locked_device.notify_queue_events();
                 }
                 Err(err) => {
                     self.common_config.driver_status |= DEVICE_NEEDS_RESET;

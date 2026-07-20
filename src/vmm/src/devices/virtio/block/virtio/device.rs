@@ -42,8 +42,8 @@ use crate::logger::{IncMetric, error, warn};
 use crate::rate_limiter::{BucketUpdate, RateLimiter};
 use crate::seccomp::BpfProgram;
 use crate::utils::u64_to_usize;
-use crate::vmm_config::RateLimiterConfig;
 use crate::vmm_config::drive::BlockDeviceConfig;
+use crate::vmm_config::{RateLimiterConfig, TokenBucketConfig};
 use crate::vstate::memory::GuestMemoryMmap;
 
 /// The engine file type, either Sync or Async (through io_uring).
@@ -174,7 +174,7 @@ pub struct ConfigSpace {
 unsafe impl ByteValued for ConfigSpace {}
 
 /// Use this structure to set up the Block Device before booting the kernel.
-#[derive(Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct VirtioBlockConfig {
     /// Unique identifier of the drive.
@@ -260,16 +260,19 @@ pub struct VirtioBlock {
     pub activate_evt: EventFd,
 
     // Implementation specific fields.
-    pub id: String,
-    pub partuuid: Option<String>,
-    pub cache_type: CacheType,
-    pub root_device: bool,
-    pub read_only: bool,
-    pub threaded: bool,
+    pub(crate) config: VirtioBlockConfig,
     pub seccomp_filter: Arc<BpfProgram>,
 
     pub metrics: Arc<BlockDeviceMetrics>,
     pub(crate) state: BlockState,
+}
+
+fn apply_bucket_update(config: &mut Option<TokenBucketConfig>, update: &BucketUpdate) {
+    match update {
+        BucketUpdate::None => {}
+        BucketUpdate::Disabled => *config = None,
+        BucketUpdate::Update(bucket) => *config = Some(bucket.into()),
+    }
 }
 
 /// State of data-path resources ownership
@@ -346,9 +349,9 @@ impl VirtioBlock {
     /// Create a new virtio block device that operates on the given file.
     ///
     /// The given file must be seekable and sizable.
-    pub fn new(config: VirtioBlockConfig) -> Result<VirtioBlock, VirtioBlockError> {
+    pub fn new(mut config: VirtioBlockConfig) -> Result<VirtioBlock, VirtioBlockError> {
         let disk_properties = DiskProperties::new(
-            config.path_on_host,
+            config.path_on_host.clone(),
             config.is_read_only,
             config.file_engine_type,
         )?;
@@ -357,6 +360,8 @@ impl VirtioBlock {
             .rate_limiter
             .map(RateLimiter::from)
             .unwrap_or_default();
+        let rate_limiter_cfg: RateLimiterConfig = (&rate_limiter).into();
+        config.rate_limiter = rate_limiter_cfg.into_option();
 
         let blk_resources = BlockResources {
             queues: BLOCK_QUEUE_SIZES.iter().map(|&s| Queue::new(s)).collect(),
@@ -386,15 +391,9 @@ impl VirtioBlock {
             config_space,
             activate_evt: EventFd::new(libc::EFD_NONBLOCK).map_err(VirtioBlockError::EventFd)?,
 
-            id: config.drive_id.clone(),
-            partuuid: config.partuuid,
-            cache_type: config.cache_type,
-            root_device: config.is_root_device,
-            read_only: config.is_read_only,
-
-            threaded: config.threaded,
+            metrics: BlockMetricsPerDevice::alloc(config.drive_id.clone()),
+            config,
             state: BlockState::Configuring(blk_resources, None),
-            metrics: BlockMetricsPerDevice::alloc(config.drive_id),
             seccomp_filter: Arc::new(vec![]),
         })
     }
@@ -438,23 +437,13 @@ impl VirtioBlock {
 
     /// Returns a copy of a device config
     pub fn config(&self) -> VirtioBlockConfig {
-        let rl: RateLimiterConfig = self.rate_limiter().into();
-        VirtioBlockConfig {
-            drive_id: self.id.clone(),
-            path_on_host: self.disk().file_path.clone(),
-            is_root_device: self.root_device,
-            partuuid: self.partuuid.clone(),
-            is_read_only: self.read_only,
-            threaded: self.threaded,
-            cache_type: self.cache_type,
-            rate_limiter: rl.into_option(),
-            file_engine_type: self.file_engine_type(),
-        }
+        self.config.clone()
     }
 
     /// Update the backing file and the config space of the block device.
     pub fn update_disk_image(&mut self, disk_image_path: String) -> Result<(), VirtioBlockError> {
-        let read_only = self.read_only;
+        let config_path = disk_image_path.clone();
+        let read_only = self.config.is_read_only;
         let nsectors = match &mut self.state {
             BlockState::Configuring(res, _) => {
                 res.disk.update(disk_image_path, read_only)?;
@@ -470,6 +459,7 @@ impl VirtioBlock {
         };
 
         self.config_space.capacity = nsectors.to_le();
+        self.config.path_on_host = config_path;
 
         // Kick the driver to pick up the changes. (But only if the device is already activated).
         if self.is_activated() {
@@ -484,6 +474,10 @@ impl VirtioBlock {
 
     /// Updates the parameters for the rate limiter
     pub fn update_rate_limiter(&mut self, bytes: BucketUpdate, ops: BucketUpdate) {
+        let mut rate_limiter = self.config.rate_limiter.unwrap_or_default();
+        apply_bucket_update(&mut rate_limiter.bandwidth, &bytes);
+        apply_bucket_update(&mut rate_limiter.ops, &ops);
+
         match &mut self.state {
             BlockState::Configuring(res, _) => res.rate_limiter.update_buckets(bytes, ops),
             BlockState::Active(ActiveBlock::Threaded(ab)) => {
@@ -494,6 +488,7 @@ impl VirtioBlock {
             }
             _ => unreachable!("not a runtime state"),
         }
+        self.config.rate_limiter = rate_limiter.into_option();
     }
 
     pub(crate) fn process_virtio_queues(&mut self) -> Result<(), InvalidAvailIdx> {
@@ -573,7 +568,7 @@ impl VirtioBlock {
 
         // threaded: registers events at init()
         // when the spawned thread subscribes to its event manager
-        if !self.threaded {
+        if !self.config.threaded {
             self.register_runtime_events(ops);
         }
 
@@ -590,7 +585,7 @@ impl VirtioBlock {
     pub(crate) fn init_events(&mut self, ops: &mut EventOps) {
         if self.is_activated() {
             // hit on restore where the device is already active at sub time
-            if !self.threaded {
+            if !self.config.threaded {
                 self.register_runtime_events(ops);
             }
         } else {
@@ -655,7 +650,7 @@ impl VirtioDevice for VirtioBlock {
     }
 
     fn id(&self) -> &str {
-        &self.id
+        &self.config.drive_id
     }
 
     fn queues(&self) -> &[Queue] {
@@ -749,7 +744,7 @@ impl VirtioDevice for VirtioBlock {
             metrics: self.metrics.clone(),
         };
 
-        if self.threaded {
+        if self.config.threaded {
             let worker_handle = handle.expect("Worker thread must be spawned before activation");
             worker_handle.start(worker);
             self.state = BlockState::Active(ActiveBlock::Threaded(ThreadedActive {
@@ -841,7 +836,7 @@ impl VirtioDevice for VirtioBlock {
     }
 
     fn spawn_worker(&mut self) -> Result<(), VirtioBlockError> {
-        if !self.threaded {
+        if !self.config.threaded {
             return Ok(());
         }
         if let BlockState::Configuring(res, handle @ None) = &mut self.state {
@@ -869,7 +864,7 @@ impl ThreadedActive {
 
 impl Drop for VirtioBlock {
     fn drop(&mut self) {
-        let flush_mode = match self.cache_type {
+        let flush_mode = match self.config.cache_type {
             CacheType::Unsafe => FlushMode::Drain,
             CacheType::Writeback => FlushMode::DrainAndFlush,
         };
@@ -2071,7 +2066,7 @@ mod tests {
     #[test]
     fn test_update_disk_image_threaded() {
         let mut block = default_block(FileEngineType::Sync);
-        block.threaded = true;
+        block.config.threaded = true;
         block.spawn_worker().unwrap();
 
         let mem = default_mem();
@@ -2089,6 +2084,10 @@ mod tests {
             .update_disk_image(String::from(path.to_str().unwrap()))
             .unwrap();
 
+        let config = block.config();
+        assert_eq!(config.path_on_host, path.to_str().unwrap());
+        assert_eq!(config.file_engine_type, FileEngineType::Sync);
+
         assert_eq!(u64::from_le(block.config_space.capacity), 3);
         assert!(
             block
@@ -2104,16 +2103,38 @@ mod tests {
     }
 
     #[test]
+    fn test_failed_update_disk_image_threaded_preserves_config() {
+        let mut block = default_block(FileEngineType::Sync);
+        block.config.threaded = true;
+        block.spawn_worker().unwrap();
+
+        let original_path = block.config().path_on_host;
+        let mem = default_mem();
+        let vq = VirtQueue::new(GuestAddress(0), &mem, 16);
+        set_queue(&mut block, 0, vq.create_queue());
+        block.activate(mem, default_interrupt()).unwrap();
+
+        let missing_path = "/path/that/does/not/exist".to_string();
+        assert!(block.update_disk_image(missing_path).is_err());
+        assert_eq!(block.config().path_on_host, original_path);
+    }
+
+    #[test]
     fn test_threaded_lifecycle() {
         for engine in [FileEngineType::Sync, FileEngineType::Async] {
             let mut block = default_block(engine);
-            block.threaded = true;
+            block.config.threaded = true;
             block.spawn_worker().unwrap();
 
             let mem = default_mem();
             let vq = VirtQueue::new(GuestAddress(0), &mem, 16);
             set_queue(&mut block, 0, vq.create_queue());
             block.activate(mem.clone(), default_interrupt()).unwrap();
+
+            let config = block.config();
+            assert!(config.threaded);
+            assert_eq!(config.file_engine_type, engine);
+            assert!(config.rate_limiter.is_some());
 
             block.prepare_save();
             let state = block.save();
@@ -2122,6 +2143,7 @@ mod tests {
 
             block.update_rate_limiter(BucketUpdate::Disabled, BucketUpdate::Disabled);
             block.kick();
+            assert!(block.config().rate_limiter.is_none());
             assert!(block.reset());
             assert!(!block.is_activated());
             assert_eq!(block.acked_features(), 0);
