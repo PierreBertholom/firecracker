@@ -35,7 +35,7 @@ use crate::devices::virtio::generated::virtio_blk::{
 };
 use crate::devices::virtio::generated::virtio_config::VIRTIO_F_VERSION_1;
 use crate::devices::virtio::generated::virtio_ring::VIRTIO_RING_F_EVENT_IDX;
-use crate::devices::virtio::queue::{InvalidAvailIdx, Queue, QueueError};
+use crate::devices::virtio::queue::{InvalidAvailIdx, Queue, QueueConfig, QueueError};
 use crate::devices::virtio::transport::{VirtioInterrupt, VirtioInterruptType};
 use crate::impl_device_type;
 use crate::logger::{IncMetric, error, warn};
@@ -325,21 +325,6 @@ pub(crate) struct ThreadedActive {
     queue_cfg: Vec<QueueConfig>,
 }
 
-#[derive(Debug, Clone, Copy)]
-struct QueueConfig {
-    max_size: u16,
-    ready: bool,
-}
-
-impl From<&Queue> for QueueConfig {
-    fn from(queue: &Queue) -> Self {
-        Self {
-            max_size: queue.max_size,
-            ready: queue.ready,
-        }
-    }
-}
-
 impl VirtioBlock {
     const PROCESS_ACTIVATE: u32 = 0;
     const PROCESS_QUEUE: u32 = 1;
@@ -398,7 +383,7 @@ impl VirtioBlock {
         })
     }
 
-    fn resources(&self) -> &BlockResources {
+    pub(crate) fn resources(&self) -> &BlockResources {
         match &self.state {
             BlockState::Configuring(res, _) => res,
             BlockState::Active(ActiveBlock::Inline(ab)) => &ab.worker.resources,
@@ -653,20 +638,44 @@ impl VirtioDevice for VirtioBlock {
         &self.config.drive_id
     }
 
-    fn queues(&self) -> &[Queue] {
-        &self.resources().queues
-    }
-
-    fn queues_mut(&mut self) -> &mut [Queue] {
-        &mut self.resources_mut().queues
-    }
-
-    fn queue_events(&self) -> &[EventFd] {
-        // reached at hot-unplug on active state
+    fn num_queues(&self) -> usize {
         match &self.state {
-            BlockState::Configuring(res, _) => &res.queue_evts,
-            BlockState::Active(ActiveBlock::Inline(ab)) => &ab.worker.resources.queue_evts,
-            BlockState::Active(ActiveBlock::Threaded(ta)) => ta.worker_handle.queue_events(),
+            BlockState::Configuring(res, _) => res.queues.len(),
+            BlockState::Active(ActiveBlock::Inline(active)) => active.queue_cfg.len(),
+            BlockState::Active(ActiveBlock::Threaded(active)) => active.queue_cfg.len(),
+            BlockState::Placeholder => unreachable!("not a runtime state"),
+        }
+    }
+
+    fn queue_config(&self, index: usize) -> Option<&QueueConfig> {
+        match &self.state {
+            BlockState::Configuring(res, _) => res.queues.get(index).map(|queue| &queue.config),
+            BlockState::Active(ActiveBlock::Inline(active)) => active.queue_cfg.get(index),
+            BlockState::Active(ActiveBlock::Threaded(active)) => active.queue_cfg.get(index),
+            BlockState::Placeholder => unreachable!("not a runtime state"),
+        }
+    }
+
+    fn queue_config_mut(&mut self, index: usize) -> Option<&mut QueueConfig> {
+        match &mut self.state {
+            BlockState::Configuring(res, _) => {
+                res.queues.get_mut(index).map(|queue| &mut queue.config)
+            }
+            BlockState::Active(ActiveBlock::Inline(active)) => active.queue_cfg.get_mut(index),
+            BlockState::Active(ActiveBlock::Threaded(active)) => active.queue_cfg.get_mut(index),
+            BlockState::Placeholder => unreachable!("not a runtime state"),
+        }
+    }
+
+    fn queue_event(&self, index: usize) -> Option<&EventFd> {
+        match &self.state {
+            BlockState::Configuring(res, _) => res.queue_evts.get(index),
+            BlockState::Active(ActiveBlock::Inline(ab)) => {
+                ab.worker.resources.queue_evts.get(index)
+            }
+            BlockState::Active(ActiveBlock::Threaded(ta)) => {
+                ta.worker_handle.queue_events().get(index)
+            }
             BlockState::Placeholder => unreachable!("not a runtime state"),
         }
     }
@@ -733,7 +742,11 @@ impl VirtioDevice for VirtioBlock {
             }
         }
 
-        let queue_cfg = res.queues.iter().map(QueueConfig::from).collect();
+        let queue_cfg = res
+            .queues
+            .iter()
+            .map(|queue| queue.config.clone())
+            .collect();
 
         let worker = BlockWorker {
             resources: res,
@@ -810,6 +823,12 @@ impl VirtioDevice for VirtioBlock {
 
     fn _reset(&mut self) -> bool {
         true
+    }
+
+    fn reset_queues(&mut self) {
+        if let BlockState::Configuring(res, _) = &mut self.state {
+            res.reset_for_reactivation();
+        }
     }
 
     fn kick(&mut self) {

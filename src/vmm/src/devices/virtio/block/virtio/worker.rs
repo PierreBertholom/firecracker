@@ -386,7 +386,7 @@ impl BlockResources {
     pub(crate) fn reset_for_reactivation(&mut self) {
         self.is_io_engine_throttled = false;
         for queue in self.queues.iter_mut() {
-            *queue = Queue::new(queue.max_size);
+            queue.reset();
         }
     }
 }
