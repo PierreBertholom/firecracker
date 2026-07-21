@@ -32,6 +32,21 @@ perf_test = {
         "devtool_opts": "-c 1-10 -m 0",
         "ab_opts": "--noise-threshold bw_read=0.1",
     },
+    "device-io-block-net": {
+        "label": "device-io-block-net",
+        "tests": "integration_tests/performance/test_device_io_interference.py::test_block_net_throughput_interference",
+        "devtool_opts": "-c 1-16 -m 0",
+    },
+    "device-io-network-latency": {
+        "label": "device-io-network-latency",
+        "tests": "integration_tests/performance/test_device_io_interference.py::test_network_latency_under_block_load",
+        "devtool_opts": "-c 1-16 -m 0",
+    },
+    "device-io-multi-block": {
+        "label": "device-io-multi-block",
+        "tests": "integration_tests/performance/test_device_io_interference.py::test_multi_block_throughput",
+        "devtool_opts": "-c 1-16 -m 0",
+    },
     "pmem": {
         "label": "pmem",
         "tests": "integration_tests/performance/test_pmem.py",

@@ -616,9 +616,20 @@ class Microvm:
             return True
         return False
 
+    def pin_block_workers(self, first_cpu: int) -> int:
+        """Pin each block worker to a consecutive CPU and return the next free CPU."""
+        if not self.firecracker_pid:
+            return first_cpu
+
+        workers = utils.get_threads(self.firecracker_pid).get("fc_blk_worker", [])
+        for offset, thread in enumerate(workers):
+            utils.set_cpu_affinity(thread, [first_cpu + offset])
+        return first_cpu + len(workers)
+
     def pin_threads(self, first_cpu):
         """
-        Pins all microvm threads (VMM, API and vCPUs) to consecutive physical cpu core, starting with "first_cpu"
+        Pins all microvm threads (VMM, API, vCPUs and block workers) to consecutive physical
+        CPU cores, starting with "first_cpu".
 
         Return next "free" cpu core.
         """
@@ -636,7 +647,7 @@ class Microvm:
             first_cpu + self.vcpus_count + 1
         ), "Failed to pin fc_api thread."
 
-        return first_cpu + self.vcpus_count + 2
+        return self.pin_block_workers(first_cpu + self.vcpus_count + 2)
 
     def add_pre_cmd(self, pre_cmd):
         """Prepends commands to the command line to launch the microVM
