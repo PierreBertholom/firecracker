@@ -54,7 +54,9 @@ impl VirtioBlock {
         if let Err(err) = self.activate_evt.read() {
             error!("Failed to consume block activate event: {:?}", err);
         }
-        self.register_runtime_events(ops);
+        if !self.is_threaded_active() {
+            self.register_runtime_events(ops);
+        }
         if let Err(err) = ops.remove(Events::with_data(
             &self.activate_evt,
             Self::PROCESS_ACTIVATE,
@@ -116,7 +118,9 @@ impl MutEventSubscriber for VirtioBlock {
         //  - on device activation (is-activated already true at this point),
         //  - on device restore from snapshot.
         if self.is_activated() {
-            self.register_runtime_events(ops);
+            if !self.is_threaded_active() {
+                self.register_runtime_events(ops);
+            }
         } else {
             self.register_activate_event(ops);
         }

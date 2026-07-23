@@ -140,7 +140,7 @@ impl Persist<'_> for VirtioBlock {
             activate_evt: EventFd::new(libc::EFD_NONBLOCK).map_err(VirtioBlockError::EventFd)?,
 
             config,
-            state: BlockState::Configuring(resources),
+            state: BlockState::Configuring(resources, None),
             metrics: BlockMetricsPerDevice::alloc(state.id.clone()),
         })
     }
