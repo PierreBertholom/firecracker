@@ -32,7 +32,8 @@ pub(crate) struct BlockWorker {
 struct ThreadedWorker {
     state: WorkerState,
     control_evt: EventFd,
-    control_rx: Receiver<ControlMsg>,
+    from_vmm: Receiver<ControlMsg>,
+    to_vmm: Sender<ControlResponse>,
 }
 
 /// Data-path ownership state of the worker thread.
@@ -47,13 +48,20 @@ enum WorkerState {
 #[allow(clippy::large_enum_variant)]
 enum ControlMsg {
     Start(BlockWorker),
+    Reset,
     Finish(FlushMode),
+}
+
+#[allow(clippy::large_enum_variant)]
+enum ControlResponse {
+    Reset(Option<BlockResources>),
 }
 
 /// VMM-side handle for controlling and joining a block worker thread.
 #[derive(Debug)]
 pub(crate) struct WorkerHandle {
-    control_tx: Sender<ControlMsg>,
+    to_worker: Sender<ControlMsg>,
+    from_worker: Receiver<ControlResponse>,
     control_evt: EventFd,
     join: JoinHandle<()>,
     queue_evts: Vec<EventFd>,
@@ -303,18 +311,21 @@ impl WorkerHandle {
         // handle writes and worker reads the control eventfd
         let control_evt = EventFd::new(libc::EFD_NONBLOCK)?;
         let handle_evt = control_evt.try_clone()?;
-        let (control_tx, control_rx) = channel::<ControlMsg>();
+
+        let (to_worker, from_vmm) = channel::<ControlMsg>();
+        let (to_vmm, from_worker) = channel::<ControlResponse>();
 
         let join = thread::Builder::new()
             .name(name)
             .spawn(move || {
                 let event_manager =
                     EventManager::new().expect("Failed to create block worker EventManager");
-                run_worker_loop(event_manager, control_evt, control_rx);
+                run_worker_loop(event_manager, control_evt, from_vmm, to_vmm);
             })?;
 
         Ok(Self {
-            control_tx,
+            to_worker,
+            from_worker,
             control_evt: handle_evt,
             join,
             queue_evts,
@@ -327,7 +338,7 @@ impl WorkerHandle {
 
     /// Transfer data-path resources to the worker thread and start processing.
     pub(crate) fn start(&self, worker: BlockWorker) {
-        if let Err(err) = self.control_tx.send(ControlMsg::Start(worker)) {
+        if let Err(err) = self.to_worker.send(ControlMsg::Start(worker)) {
             error!("Failed to send block worker start message: {:?}", err);
             return;
         }
@@ -337,11 +348,40 @@ impl WorkerHandle {
         }
     }
 
+    /// Stop processing and return the data-path resources to the VMM thread.
+    pub(crate) fn reset(&self) -> Option<BlockResources> {
+        if let Err(err) = self.to_worker.send(ControlMsg::Reset) {
+            error!(
+                "Block worker receiver already dropped during reset: {:?}",
+                err
+            );
+            return None;
+        }
+
+        if let Err(err) = self.control_evt.write(1) {
+            error!(
+                "Block worker control event is closed during reset: {:?}",
+                err
+            );
+            return None;
+        }
+
+        match self.from_worker.recv() {
+            Ok(ControlResponse::Reset(resources)) => resources,
+            Err(err) => {
+                error!("Block worker failed to acknowledge reset: {:?}", err);
+                None
+            }
+        }
+    }
+
     /// Stop the worker and wait for its thread to exit.
     pub(crate) fn finish(self, flush_mode: FlushMode) {
-        if let Err(err) = self.control_tx.send(ControlMsg::Finish(flush_mode)) {
+        if let Err(err) = self.to_worker.send(ControlMsg::Finish(flush_mode)) {
             error!("Block worker receiver already dropped: {:?}", err);
-        } else if let Err(err) = self.control_evt.write(1) {
+        }
+
+        if let Err(err) = self.control_evt.write(1) {
             error!("Block worker control event is closed: {:?}", err);
         }
 
@@ -428,9 +468,10 @@ impl ThreadedWorker {
             return;
         }
 
-        while let Ok(msg) = self.control_rx.try_recv() {
+        while let Ok(msg) = self.from_vmm.try_recv() {
             match msg {
                 ControlMsg::Start(worker) => self.start_worker(worker, ops),
+                ControlMsg::Reset => self.reset_worker(ops),
                 ControlMsg::Finish(flush_mode) => self.finish_worker(flush_mode, ops),
             }
 
@@ -448,6 +489,33 @@ impl ThreadedWorker {
 
         Self::register_runtime_events(&worker.resources, ops);
         self.state = WorkerState::Running(worker);
+    }
+
+    fn reset_worker(&mut self, ops: &mut EventOps) {
+        let resources = match std::mem::replace(&mut self.state, WorkerState::Parked) {
+            WorkerState::Running(mut worker) => {
+                Self::unregister_runtime_events(&worker.resources, ops);
+                if worker.reset() {
+                    Some(worker.resources)
+                } else {
+                    Self::register_runtime_events(&worker.resources, ops);
+                    self.state = WorkerState::Running(worker);
+                    None
+                }
+            }
+            WorkerState::Parked => {
+                warn!("Reset requested while block worker is parked");
+                None
+            }
+            WorkerState::Finished => {
+                self.state = WorkerState::Finished;
+                None
+            }
+        };
+
+        if let Err(err) = self.to_vmm.send(ControlResponse::Reset(resources)) {
+            error!("Failed to send block worker reset response: {:?}", err);
+        }
     }
 
     fn finish_worker(&mut self, flush_mode: FlushMode, ops: &mut EventOps) {
@@ -471,12 +539,14 @@ impl ThreadedWorker {
 fn run_worker_loop(
     mut event_manager: EventManager,
     control_evt: EventFd,
-    control_rx: Receiver<ControlMsg>,
+    from_vmm: Receiver<ControlMsg>,
+    to_vmm: Sender<ControlResponse>,
 ) {
     let worker = Arc::new(Mutex::new(ThreadedWorker {
         state: WorkerState::Parked,
         control_evt,
-        control_rx,
+        from_vmm,
+        to_vmm,
     }));
     let subscriber: Arc<Mutex<dyn MutEventSubscriber>> = worker.clone();
     event_manager.add_subscriber(subscriber);
