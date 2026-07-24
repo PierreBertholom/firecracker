@@ -48,12 +48,15 @@ enum WorkerState {
 #[allow(clippy::large_enum_variant)]
 enum ControlMsg {
     Start(BlockWorker),
+    UpdateDiskImage(String, bool),
+    UpdateRateLimiter(BucketUpdate, BucketUpdate),
     Reset,
     Finish(FlushMode),
 }
 
 #[allow(clippy::large_enum_variant)]
 enum ControlResponse {
+    DiskUpdated(Result<u64, VirtioBlockError>),
     Reset(Option<BlockResources>),
 }
 
@@ -366,12 +369,74 @@ impl WorkerHandle {
             return None;
         }
 
-        match self.from_worker.recv() {
-            Ok(ControlResponse::Reset(resources)) => resources,
-            Err(err) => {
-                error!("Block worker failed to acknowledge reset: {:?}", err);
-                None
+        loop {
+            match self.from_worker.recv() {
+                Ok(ControlResponse::Reset(resources)) => return resources,
+                Ok(ControlResponse::DiskUpdated(_)) => {
+                    warn!("Ignoring disk update response while waiting for reset");
+                }
+                Err(err) => {
+                    error!("Block worker failed to acknowledge reset: {:?}", err);
+                    return None;
+                }
             }
+        }
+    }
+
+    /// Replace the worker's backing file and return its new sector count.
+    pub(crate) fn update_disk_image(
+        &self,
+        disk_image_path: String,
+        read_only: bool,
+    ) -> Result<u64, VirtioBlockError> {
+        if let Err(err) = self
+            .to_worker
+            .send(ControlMsg::UpdateDiskImage(disk_image_path, read_only))
+        {
+            error!("Failed to send block worker disk update: {:?}", err);
+            return Err(VirtioBlockError::WorkerControl(format!(
+                "failed to send disk update: {err}"
+            )));
+        }
+
+        if let Err(err) = self.control_evt.write(1) {
+            error!("Failed to notify block worker of disk update: {:?}", err);
+            return Err(VirtioBlockError::WorkerControl(format!(
+                "failed to notify worker of disk update: {err}"
+            )));
+        }
+
+        loop {
+            match self.from_worker.recv() {
+                Ok(ControlResponse::DiskUpdated(result)) => return result,
+                Ok(ControlResponse::Reset(_)) => {
+                    warn!("Ignoring reset response while waiting for disk update");
+                }
+                Err(err) => {
+                    error!("Block worker failed to acknowledge disk update: {:?}", err);
+                    return Err(VirtioBlockError::WorkerControl(format!(
+                        "failed to receive disk update response: {err}"
+                    )));
+                }
+            }
+        }
+    }
+
+    /// Forward a rate limiter update to the worker thread.
+    pub(crate) fn update_rate_limiter(&self, bytes: BucketUpdate, ops: BucketUpdate) {
+        if let Err(err) = self
+            .to_worker
+            .send(ControlMsg::UpdateRateLimiter(bytes, ops))
+        {
+            error!("Failed to send block worker rate limiter update: {:?}", err);
+            return;
+        }
+
+        if let Err(err) = self.control_evt.write(1) {
+            error!(
+                "Failed to notify block worker of rate limiter update: {:?}",
+                err
+            );
         }
     }
 
@@ -471,6 +536,10 @@ impl ThreadedWorker {
         while let Ok(msg) = self.from_vmm.try_recv() {
             match msg {
                 ControlMsg::Start(worker) => self.start_worker(worker, ops),
+                ControlMsg::UpdateDiskImage(path, read_only) => {
+                    self.update_disk_image(path, read_only)
+                }
+                ControlMsg::UpdateRateLimiter(bytes, ops) => self.update_rate_limiter(bytes, ops),
                 ControlMsg::Reset => self.reset_worker(ops),
                 ControlMsg::Finish(flush_mode) => self.finish_worker(flush_mode, ops),
             }
@@ -489,6 +558,43 @@ impl ThreadedWorker {
 
         Self::register_runtime_events(&worker.resources, ops);
         self.state = WorkerState::Running(worker);
+    }
+
+    fn update_disk_image(&mut self, path: String, read_only: bool) {
+        let result = match &mut self.state {
+            WorkerState::Running(worker) => worker.update_disk_image(path, read_only),
+            WorkerState::Parked => {
+                warn!("Disk image update requested while block worker is parked");
+                Err(VirtioBlockError::WorkerControl(
+                    "disk update requested while worker is parked".to_string(),
+                ))
+            }
+            WorkerState::Finished => {
+                warn!("Disk image update requested after block worker finished");
+                Err(VirtioBlockError::WorkerControl(
+                    "disk update requested after worker finished".to_string(),
+                ))
+            }
+        };
+
+        if let Err(err) = self.to_vmm.send(ControlResponse::DiskUpdated(result)) {
+            error!(
+                "Failed to send block worker disk update response: {:?}",
+                err
+            );
+        }
+    }
+
+    fn update_rate_limiter(&mut self, bytes: BucketUpdate, ops: BucketUpdate) {
+        match &mut self.state {
+            WorkerState::Running(worker) => worker.update_rate_limiter(bytes, ops),
+            WorkerState::Parked => {
+                warn!("Rate limiter update requested while block worker is parked");
+            }
+            WorkerState::Finished => {
+                warn!("Rate limiter update requested after block worker finished");
+            }
+        }
     }
 
     fn reset_worker(&mut self, ops: &mut EventOps) {
