@@ -15,7 +15,6 @@ use crate::device_manager::DevicePersistError;
 use crate::devices::pci::PciSegment;
 use crate::devices::virtio::balloon::Balloon;
 use crate::devices::virtio::balloon::persist::{BalloonConstructorArgs, BalloonState};
-use crate::devices::virtio::block::BlockError;
 use crate::devices::virtio::block::device::Block;
 use crate::devices::virtio::block::persist::{BlockConstructorArgs, BlockState};
 use crate::devices::virtio::device::{VirtioDevice, VirtioDeviceId, VirtioDeviceType};
@@ -520,17 +519,11 @@ impl<'a> Persist<'a> for PciDevices {
                 BlockConstructorArgs { mem: mem.clone() },
                 &block_state.device_state,
             )?));
-            let seccomp_filter = constructor_args
-                .seccomp_filters
-                .get("blk_worker")
-                .ok_or(BlockError::MissingSeccompFilter)?
-                .clone();
 
             device
                 .lock()
                 .expect("Poisoned lock")
-                .spawn_worker(seccomp_filter)
-                .map_err(BlockError::VirtioBackend)?;
+                .spawn_worker(constructor_args.seccomp_filters.get("blk_worker").cloned())?;
 
             constructor_args
                 .vm_resources
@@ -847,6 +840,7 @@ mod tests {
       "is_root_device": true,
       "cache_type": "Unsafe",
       "is_read_only": true,
+      "threaded": false,
       "path_on_host": "{}",
       "rate_limiter": null,
       "io_engine": "Sync",

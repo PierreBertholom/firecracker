@@ -29,8 +29,8 @@ use crate::device_manager::{
     DeviceRestoreArgs,
 };
 use crate::devices::virtio::balloon::Balloon;
+use crate::devices::virtio::block::BlockError;
 use crate::devices::virtio::block::device::Block;
-use crate::devices::virtio::block::virtio::VirtioBlockError;
 use crate::devices::virtio::device::VirtioDevice;
 use crate::devices::virtio::mem::{VIRTIO_MEM_DEFAULT_SLOT_SIZE_MIB, VirtioMem};
 use crate::devices::virtio::net::Net;
@@ -111,7 +111,7 @@ pub enum StartMicrovmError {
     /// Cannot open the block device backing file: {0}
     OpenBlockDevice(io::Error),
     /// Failed to spawn the block worker thread: {0}
-    SpawnBlockWorker(VirtioBlockError),
+    SpawnBlockWorker(BlockError),
     /// Cannot restore microvm state: {0}
     RestoreMicrovmState(MicrovmStateError),
     /// Cannot set vm resources: {0}
@@ -679,14 +679,10 @@ fn attach_block_devices<'a, I: Iterator<Item = &'a Arc<Mutex<Block>>> + Debug>(
             (locked.id().to_string(), locked.is_vhost_user())
         };
 
-        let seccomp_filter = seccomp_filters
-            .get("blk_worker")
-            .ok_or_else(|| StartMicrovmError::MissingSeccompFilters("blk_worker".to_string()))?;
-
         block
             .lock()
             .expect("Poisoned lock")
-            .spawn_worker(seccomp_filter.clone())
+            .spawn_worker(seccomp_filters.get("blk_worker").cloned())
             .map_err(StartMicrovmError::SpawnBlockWorker)?;
 
         // The device mutex mustn't be locked here otherwise it will deadlock.
@@ -909,6 +905,7 @@ pub(crate) mod tests {
                 cache_type: custom_block_cfg.cache_type,
 
                 is_read_only: Some(custom_block_cfg.is_read_only),
+                threaded: false,
                 path_on_host: Some(
                     block_files
                         .last()

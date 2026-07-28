@@ -497,15 +497,9 @@ impl DeviceManager {
         }
 
         let mut block = Block::new(config).map_err(DriveError::CreateBlockDevice)?;
-        let seccomp_filter = seccomp_filters
-            .get("blk_worker")
-            .ok_or(BlockError::MissingSeccompFilter)
-            .map_err(DriveError::CreateBlockDevice)?
-            .clone();
-
         block
-            .spawn_worker(seccomp_filter)
-            .map_err(|err| DriveError::CreateBlockDevice(BlockError::VirtioBackend(err)))?;
+            .spawn_worker(seccomp_filters.get("blk_worker").cloned())
+            .map_err(DriveError::CreateBlockDevice)?;
 
         Ok(Arc::new(Mutex::new(block)))
     }
@@ -927,6 +921,7 @@ pub(crate) mod tests {
             is_root_device: is_root,
             cache_type: CacheType::Unsafe,
             is_read_only: Some(false),
+            threaded: false,
             path_on_host: Some(f.as_path().to_str().unwrap().to_string()),
             rate_limiter: None,
             file_engine_type: None,
