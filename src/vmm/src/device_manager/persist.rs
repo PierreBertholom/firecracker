@@ -19,6 +19,7 @@ use crate::devices::acpi::vmgenid::{VMGenIDState, VmGenId};
 use crate::devices::legacy::RTCDevice;
 use crate::devices::virtio::balloon::Balloon;
 use crate::devices::virtio::balloon::persist::{BalloonConstructorArgs, BalloonState};
+use crate::devices::virtio::block::BlockError;
 use crate::devices::virtio::block::device::Block;
 use crate::devices::virtio::block::persist::{BlockConstructorArgs, BlockState};
 use crate::devices::virtio::device::{VirtioDevice, VirtioDeviceType};
@@ -38,6 +39,7 @@ use crate::devices::virtio::vsock::persist::{
 use crate::devices::virtio::vsock::{Vsock, VsockUnixBackend};
 use crate::mmds::data_store::MmdsVersion;
 use crate::resources::VmResources;
+use crate::seccomp::BpfThreadMap;
 use crate::snapshot::Persist;
 use crate::vmm_config::memory_hotplug::MemoryHotplugConfig;
 use crate::vstate::memory::GuestMemoryMmap;
@@ -137,6 +139,7 @@ pub struct MMIODevManagerConstructorArgs<'a> {
     pub event_manager: &'a mut EventManager,
     pub vm_resources: &'a mut VmResources,
     pub instance_id: &'a str,
+    pub seccomp_filters: &'a BpfThreadMap,
 }
 
 pub struct MMIOPlatformDevicesConstructorArgs<'a> {
@@ -478,6 +481,17 @@ impl<'a> Persist<'a> for MMIOVirtioDevices {
                 BlockConstructorArgs { mem: mem.clone() },
                 &block_state.device_state,
             )?));
+            let seccomp_filter = constructor_args
+                .seccomp_filters
+                .get("blk_worker")
+                .ok_or(BlockError::MissingSeccompFilter)?
+                .clone();
+
+            device
+                .lock()
+                .expect("Poisoned lock")
+                .spawn_worker(seccomp_filter)
+                .map_err(BlockError::VirtioBackend)?;
 
             constructor_args
                 .vm_resources
@@ -649,6 +663,7 @@ mod tests {
     use crate::device_manager;
     use crate::devices::virtio::block::CacheType;
     use crate::resources::VmmConfig;
+    use crate::seccomp::get_empty_filters;
     use crate::vmm_config::balloon::BalloonDeviceConfig;
     use crate::vmm_config::entropy::EntropyDeviceConfig;
     use crate::vmm_config::memory_hotplug::MemoryHotplugConfig;
@@ -806,6 +821,7 @@ mod tests {
             event_manager: &mut event_manager,
             vm_resources,
             instance_id: "microvm-id",
+            seccomp_filters: &get_empty_filters(),
         };
         let _restored_dev_manager = MMIOVirtioDevices::restore(restore_args, mmio_state).unwrap();
 

@@ -9,6 +9,7 @@ use vmm_sys_util::eventfd::EventFd;
 use super::BlockError;
 use super::persist::{BlockConstructorArgs, BlockState};
 use super::vhost_user::device::{VhostUserBlock, VhostUserBlockConfig};
+use super::virtio::VirtioBlockError;
 use super::virtio::device::{VirtioBlock, VirtioBlockConfig};
 use crate::devices::virtio::ActivateError;
 use crate::devices::virtio::device::{VirtioDevice, VirtioDeviceType};
@@ -16,6 +17,7 @@ use crate::devices::virtio::queue::{InvalidAvailIdx, QueueConfig, QueueError};
 use crate::devices::virtio::transport::VirtioInterrupt;
 use crate::impl_device_type;
 use crate::rate_limiter::BucketUpdate;
+use crate::seccomp::BpfProgram;
 use crate::snapshot::Persist;
 use crate::vmm_config::drive::BlockDeviceConfig;
 use crate::vstate::memory::GuestMemoryMmap;
@@ -112,6 +114,16 @@ impl Block {
         match self {
             Self::Virtio(_) => false,
             Self::VhostUser(_) => true,
+        }
+    }
+
+    pub(crate) fn spawn_worker(
+        &mut self,
+        seccomp_filter: Arc<BpfProgram>,
+    ) -> Result<(), VirtioBlockError> {
+        match self {
+            Self::Virtio(b) => b.spawn_worker(seccomp_filter),
+            Self::VhostUser(_) => Ok(()),
         }
     }
 }
