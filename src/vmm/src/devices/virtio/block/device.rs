@@ -122,9 +122,10 @@ impl Block {
         seccomp_filter: Option<Arc<BpfProgram>>,
     ) -> Result<(), BlockError> {
         match self {
-            Self::Virtio(b) => b
+            Self::Virtio(b) if b.config.threaded => b
                 .spawn_worker(seccomp_filter.ok_or(BlockError::MissingSeccompFilter)?)
                 .map_err(BlockError::VirtioBackend),
+            Self::Virtio(_) => Ok(()),
             Self::VhostUser(_) => Ok(()),
         }
     }
