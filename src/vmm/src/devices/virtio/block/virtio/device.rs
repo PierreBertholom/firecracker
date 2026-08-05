@@ -991,7 +991,7 @@ impl VirtioDevice for VirtioBlock {
             }
 
             let mut spawned = Vec::with_capacity(res.len());
-            for r in res {
+            for (q_index, r) in res.iter().enumerate() {
                 let queue_evt = match r.queue_evt.try_clone() {
                     Ok(queue_evt) => queue_evt,
                     Err(err) => {
@@ -1001,7 +1001,9 @@ impl VirtioDevice for VirtioBlock {
                         return Err(VirtioBlockError::EventFd(err));
                     }
                 };
-                let handle = match WorkerHandle::spawn(self.seccomp_filter.clone(), queue_evt) {
+                let name = format!("fc_blk_{}_q{}", self.id, q_index);
+                let handle =
+                    match WorkerHandle::spawn(self.seccomp_filter.clone(), queue_evt, name) {
                     Ok(handle) => handle,
                     Err(err) => {
                         spawned

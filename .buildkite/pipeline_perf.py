@@ -34,7 +34,11 @@ perf_test = {
     },
     "device-io-block-net": {
         "label": "device-io-block-net",
-        "tests": "integration_tests/performance/test_device_io_interference.py::test_block_net_throughput_interference",
+        "tests": (
+            "integration_tests/performance/test_device_io_interference.py::"
+            "test_block_net_throughput_interference "
+            "integration_tests/performance/test_device_io_interference.py::test_net_only"
+        ),
         "devtool_opts": "-c 1-16 -m 0",
     },
     "device-io-network-latency": {

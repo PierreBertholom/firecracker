@@ -621,7 +621,12 @@ class Microvm:
         if not self.firecracker_pid:
             return first_cpu
 
-        workers = utils.get_threads(self.firecracker_pid).get("fc_blk_worker", [])
+        workers = sorted(
+            thread
+            for name, threads in utils.get_threads(self.firecracker_pid).items()
+            if name.startswith("fc_blk")
+            for thread in threads
+        )
         for offset, thread in enumerate(workers):
             utils.set_cpu_affinity(thread, [first_cpu + offset])
         return first_cpu + len(workers)

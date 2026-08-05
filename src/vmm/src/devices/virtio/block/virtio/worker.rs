@@ -114,6 +114,7 @@ impl WorkerHandle {
     pub(crate) fn spawn(
         seccomp_filter: Arc<BpfProgram>,
         queue_evt: EventFd,
+        thread_name: String,
     ) -> Result<WorkerHandle, std::io::Error> {
         // One kick eventfd, shared between worker (registers on its epoll) and shell (writes to
         // wake it). Both refer to the same kernel object via try_clone.
@@ -124,7 +125,7 @@ impl WorkerHandle {
         let (response_tx, receiver_rx) = channel::<ControlResponse>();
 
         let join = thread::Builder::new()
-            .name("fc_blk_worker".to_owned())
+            .name(thread_name)
             .spawn(move || {
                 // epoll first (not in seccomp), then register, then lock down.
                 let event_manager = EventManager::new()

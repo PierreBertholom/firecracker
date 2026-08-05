@@ -193,7 +193,7 @@ def consume_ping_output(ping_output):
 @pytest.mark.timeout(300)
 @pytest.mark.parametrize("vcpus", [2, 4], ids=["2vcpu", "4vcpu"])
 @pytest.mark.parametrize("threaded,multiqueue", BLOCK_MODES)
-@pytest.mark.parametrize("scenario", ["block_only", "net_only", "concurrent"])
+@pytest.mark.parametrize("scenario", ["block_only", "concurrent"])
 def test_block_net_throughput_interference(
     uvm,
     vcpus,
@@ -206,7 +206,6 @@ def test_block_net_throughput_interference(
 ):
     """Measure block throughput and network throughput, isolated vs concurrent
     * ``block_only``  -> fio random-write to /dev/vdb, nothing else.
-    * ``net_only``    -> iperf3 guest->host, nothing else.
     * ``concurrent``  -> both at once, on overlapping steady-state windows
 
     The block modes compare the inline path, one threaded queue, and one
@@ -252,24 +251,16 @@ def test_block_net_throughput_interference(
         emit_cpu_metrics(cpu_util, metrics)
         return
 
-    # Both net_only and concurrent run iperf3. We align fio and iperf on the
-    # same total duration (WARMUP + RUNTIME) and omit the same warmup window so
-    # their steady-state measurement windows overlap.
     iperf_test = IPerf3Test(
         microvm=vm,
         base_port=IPERF_BASE_PORT,
-        runtime=WARMUP_SEC + RUNTIME_SEC,
+        runtime=RUNTIME_SEC,
         omit=WARMUP_SEC,
         mode="g2h",
         num_clients=vm.vcpus_count,
         connect_to=vm.iface["eth0"]["iface"].host_ip,
         payload_length="1024K",
     )
-
-    if scenario == "net_only":
-        data = iperf_test.run_test(first_free_cpu)
-        emit_iperf3_metrics(metrics, data, WARMUP_SEC)
-        return
 
     # scenario == "concurrent": launch fio in the background, then run iperf so
     # both are active during iperf's measurement window. iperf's own CPU
@@ -290,6 +281,46 @@ def test_block_net_throughput_interference(
         assert fio_future.result() == 0
 
     emit_fio_metrics(results_dir, metrics)
+    emit_iperf3_metrics(metrics, data, WARMUP_SEC)
+
+
+@pytest.mark.nonci
+@pytest.mark.timeout(300)
+@pytest.mark.parametrize("vcpus", [2, 4], ids=["2vcpu", "4vcpu"])
+def test_net_only(
+    uvm,
+    vcpus,
+    metrics,
+):
+    """Measure guest-to-host network throughput without block I/O."""
+    vm = uvm
+    vm.spawn(log_level="Info", emit_metrics=True)
+    vm.basic_config(vcpu_count=vcpus, mem_size_mib=GUEST_MEM_MIB)
+    vm.add_net_iface()
+
+    vm.start()
+
+    metrics.set_dimensions(
+        {
+            "performance_test": "test_net_only",
+            **vm.dimensions,
+        }
+    )
+
+    first_free_cpu = vm.pin_threads(0)
+
+    iperf_test = IPerf3Test(
+        microvm=vm,
+        base_port=IPERF_BASE_PORT,
+        runtime=RUNTIME_SEC,
+        omit=WARMUP_SEC,
+        mode="g2h",
+        num_clients=vm.vcpus_count,
+        connect_to=vm.iface["eth0"]["iface"].host_ip,
+        payload_length="1024K",
+    )
+
+    data = iperf_test.run_test(first_free_cpu)
     emit_iperf3_metrics(metrics, data, WARMUP_SEC)
 
 
