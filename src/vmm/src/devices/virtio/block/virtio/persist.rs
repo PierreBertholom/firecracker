@@ -3,6 +3,8 @@
 
 //! Defines the structures needed for saving/restoring block devices.
 
+use std::sync::{Arc, Mutex};
+
 use device::ConfigSpace;
 use serde::{Deserialize, Serialize};
 use vmm_sys_util::eventfd::EventFd;
@@ -71,25 +73,17 @@ impl Persist<'_> for VirtioBlock {
     type Error = VirtioBlockError;
 
     fn save(&self) -> Self::State {
-        let (virtio_state, rate_limiter_state) =
-            if let BlockState::Active(ActiveBlock::Threaded(active)) = &self.state {
-                let state = active.worker_handle.get_snapshot_state();
-                (
-                    VirtioDeviceState {
-                        device_type: VirtioDeviceType::Block,
-                        avail_features: self.avail_features,
-                        acked_features: self.acked_features,
-                        queues: state.queue_states,
-                        activated: true,
-                    },
-                    state.rate_limiter_state,
-                )
-            } else {
-                (
-                    VirtioDeviceState::from_device(self, &self.resources().queues),
-                    self.rate_limiter().save(),
-                )
-            };
+        let virtio_state = if let BlockState::Active(ActiveBlock::Threaded(active)) = &self.state {
+            VirtioDeviceState {
+                device_type: VirtioDeviceType::Block,
+                avail_features: self.avail_features,
+                acked_features: self.acked_features,
+                queues: active.worker_handle.get_queue_states(),
+                activated: true,
+            }
+        } else {
+            VirtioDeviceState::from_device(self, &self.resources().queues)
+        };
 
         VirtioBlockState {
             id: self.config.drive_id.clone(),
@@ -98,7 +92,7 @@ impl Persist<'_> for VirtioBlock {
             root_device: self.config.is_root_device,
             disk_path: self.config.path_on_host.clone(),
             virtio_state,
-            rate_limiter_state,
+            rate_limiter_state: self.rate_limiter().save(),
             file_engine_type: FileEngineTypeState::from(self.file_engine_type()),
             threaded: self.config.threaded,
         }
@@ -152,7 +146,6 @@ impl Persist<'_> for VirtioBlock {
             queues,
             queue_evts,
             disk: disk_properties,
-            rate_limiter,
             is_io_engine_throttled: false,
         };
 
@@ -163,6 +156,7 @@ impl Persist<'_> for VirtioBlock {
             activate_evt: EventFd::new(libc::EFD_NONBLOCK).map_err(VirtioBlockError::EventFd)?,
 
             config,
+            rate_limiter: Arc::new(Mutex::new(rate_limiter)),
             state: BlockState::Configuring(resources, None),
             metrics: BlockMetricsPerDevice::alloc(state.id.clone()),
         })
@@ -171,7 +165,6 @@ impl Persist<'_> for VirtioBlock {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
     use vmm_sys_util::tempfile::TempFile;
 
     use super::*;

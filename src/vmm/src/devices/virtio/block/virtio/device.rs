@@ -12,7 +12,7 @@ use std::io::{Seek, SeekFrom};
 use std::ops::Deref;
 use std::os::linux::fs::MetadataExt;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use serde::{Deserialize, Serialize};
 use vm_memory::ByteValued;
@@ -253,6 +253,7 @@ pub struct VirtioBlock {
     pub activate_evt: EventFd,
 
     pub(crate) config: VirtioBlockConfig,
+    pub(crate) rate_limiter: Arc<Mutex<RateLimiter>>,
     pub(crate) state: BlockState,
     pub metrics: Arc<BlockDeviceMetrics>,
 }
@@ -293,7 +294,6 @@ pub(crate) struct BlockResources {
     pub(crate) queues: Vec<Queue>,
     pub(crate) queue_evts: [EventFd; 1],
     pub(crate) disk: DiskProperties,
-    pub(crate) rate_limiter: RateLimiter,
     pub(crate) is_io_engine_throttled: bool,
 }
 
@@ -345,6 +345,7 @@ impl VirtioBlock {
             activate_evt: EventFd::new(libc::EFD_NONBLOCK).map_err(VirtioBlockError::EventFd)?,
 
             config,
+            rate_limiter: Arc::new(Mutex::new(rate_limiter)),
             state: BlockState::Configuring(
                 BlockResources {
                     queues: BLOCK_QUEUE_SIZES.iter().map(|&s| Queue::new(s)).collect(),
@@ -352,7 +353,6 @@ impl VirtioBlock {
                         EventFd::new(libc::EFD_NONBLOCK).map_err(VirtioBlockError::EventFd)?
                     ],
                     disk: disk_properties,
-                    rate_limiter,
                     is_io_engine_throttled: false,
                 },
                 None,
@@ -392,8 +392,10 @@ impl VirtioBlock {
         &self.resources().disk
     }
 
-    pub(crate) fn rate_limiter(&self) -> &RateLimiter {
-        &self.resources().rate_limiter
+    pub(crate) fn rate_limiter(&self) -> MutexGuard<'_, RateLimiter> {
+        self.rate_limiter
+            .lock()
+            .expect("Poisoned block rate limiter lock")
     }
 
     pub(crate) fn is_threaded_active(&self) -> bool {
@@ -420,8 +422,20 @@ impl VirtioBlock {
     }
 
     pub(crate) fn process_rate_limiter_event(&mut self) {
-        if let BlockState::Active(ActiveBlock::Inline(worker)) = &mut self.state {
-            worker.process_rate_limiter_event();
+        self.metrics.rate_limiter_event_count.inc();
+        if self.rate_limiter().event_handler().is_err() {
+            return;
+        }
+
+        match &mut self.state {
+            BlockState::Active(ActiveBlock::Inline(worker)) => {
+                worker.process_virtio_queues().unwrap();
+            }
+            BlockState::Active(ActiveBlock::Threaded(active)) => {
+                active.worker_handle.kick(false)
+            }
+            BlockState::Configuring(_, _) => {}
+            BlockState::Placeholder => unreachable!("not a runtime state"),
         }
     }
 
@@ -468,18 +482,7 @@ impl VirtioBlock {
         apply_bucket_update(&mut rate_limiter.bandwidth, &bytes);
         apply_bucket_update(&mut rate_limiter.ops, &ops);
 
-        match &mut self.state {
-            BlockState::Configuring(resources, _) => {
-                resources.rate_limiter.update_buckets(bytes, ops);
-            }
-            BlockState::Active(ActiveBlock::Inline(worker)) => {
-                worker.update_rate_limiter(bytes, ops);
-            }
-            BlockState::Active(ActiveBlock::Threaded(active)) => {
-                active.worker_handle.update_rate_limiter(bytes, ops);
-            }
-            BlockState::Placeholder => unreachable!("not a runtime state"),
-        }
+        self.rate_limiter().update_buckets(bytes, ops);
         self.config.rate_limiter = rate_limiter.into_option();
     }
 
@@ -672,8 +675,11 @@ impl VirtioDevice for VirtioBlock {
             .iter()
             .map(|queue| queue.config.clone())
             .collect();
+        let rate_limiter_blocked = self.rate_limiter().blocked_flag();
         let worker = BlockWorker {
             resources,
+            rate_limiter: self.rate_limiter.clone(),
+            rate_limiter_blocked,
             active_state: ActiveState {
                 mem,
                 interrupt: interrupt.clone(),
@@ -743,7 +749,7 @@ impl VirtioDevice for VirtioBlock {
 
     fn kick(&mut self) {
         match &self.state {
-            BlockState::Active(ActiveBlock::Threaded(active)) => active.worker_handle.kick(),
+            BlockState::Active(ActiveBlock::Threaded(active)) => active.worker_handle.kick(true),
             BlockState::Active(ActiveBlock::Inline(_)) => self.notify_queue_events(),
             BlockState::Configuring(_, _) => {}
             BlockState::Placeholder => unreachable!("not a runtime state"),
@@ -1817,7 +1823,6 @@ mod tests {
             let interrupt = default_interrupt();
             let vq = VirtQueue::new(GuestAddress(0), &mem, 16);
             set_queue(&mut block, 0, vq.create_queue());
-            block.activate(mem.clone(), interrupt).unwrap();
             read_blk_req_descriptors(&vq);
 
             let request_type_addr = GuestAddress(vq.dtable[0].addr.get());
@@ -1831,6 +1836,7 @@ mod tests {
             assert!(rl.consume(512, TokenType::Bytes));
 
             set_rate_limiter(&mut block, rl);
+            block.activate(mem.clone(), interrupt).unwrap();
 
             mem.write_obj::<u32>(VIRTIO_BLK_T_OUT, request_type_addr)
                 .unwrap();
@@ -1887,7 +1893,6 @@ mod tests {
             let interrupt = default_interrupt();
             let vq = VirtQueue::new(GuestAddress(0), &mem, 16);
             set_queue(&mut block, 0, vq.create_queue());
-            block.activate(mem.clone(), interrupt).unwrap();
             read_blk_req_descriptors(&vq);
 
             let request_type_addr = GuestAddress(vq.dtable[0].addr.get());
@@ -1900,6 +1905,7 @@ mod tests {
             assert!(rl.consume(1, TokenType::Ops));
 
             set_rate_limiter(&mut block, rl);
+            block.activate(mem.clone(), interrupt).unwrap();
 
             mem.write_obj::<u32>(VIRTIO_BLK_T_OUT, request_type_addr)
                 .unwrap();
@@ -2073,13 +2079,12 @@ mod tests {
         let ops = TokenBucket::new(1003, 1004, 1005).unwrap();
         block.update_rate_limiter(BucketUpdate::Update(bandwidth), BucketUpdate::Update(ops));
 
-        // Reset waits for the update and returns the worker-owned limiter.
-        assert!(block.reset());
         assert_eq!(
             block.config().rate_limiter,
-            RateLimiterConfig::from(block.rate_limiter()).into_option()
+            RateLimiterConfig::from(&*block.rate_limiter()).into_option()
         );
 
+        assert!(block.reset());
         set_queue(&mut block, 0, vq.create_queue());
         block.activate(mem, default_interrupt()).unwrap();
         block.update_rate_limiter(BucketUpdate::Disabled, BucketUpdate::Disabled);

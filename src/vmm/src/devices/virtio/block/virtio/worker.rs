@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use event_manager::{EventOps, Events, MutEventSubscriber, SubscriberOps};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -18,8 +19,7 @@ use crate::devices::virtio::persist::QueueState;
 use crate::devices::virtio::queue::{InvalidAvailIdx, QueueError};
 use crate::devices::virtio::transport::VirtioInterruptType;
 use crate::logger::{IncMetric, error, warn};
-use crate::rate_limiter::BucketUpdate;
-use crate::rate_limiter::persist::RateLimiterState;
+use crate::rate_limiter::RateLimiter;
 use crate::seccomp::{BpfProgram, apply_filter};
 use crate::snapshot::Persist;
 
@@ -27,15 +27,10 @@ use crate::snapshot::Persist;
 #[derive(Debug)]
 pub(crate) struct BlockWorker {
     pub(crate) resources: BlockResources,
+    pub(crate) rate_limiter: Arc<Mutex<RateLimiter>>,
+    pub(crate) rate_limiter_blocked: Arc<AtomicBool>,
     pub(crate) active_state: ActiveState,
     pub(crate) metrics: Arc<BlockDeviceMetrics>,
-}
-
-/// Worker-owned state required to save a block device.
-#[derive(Debug)]
-pub(crate) struct WorkerSnapshotState {
-    pub(crate) queue_states: Vec<QueueState>,
-    pub(crate) rate_limiter_state: RateLimiterState,
 }
 
 /// Worker state and control channel side (recv ctl msg)
@@ -61,11 +56,10 @@ enum WorkerState {
 enum ControlMsg {
     Start(BlockWorker),
     UpdateDiskImage(String, bool),
-    UpdateRateLimiter(BucketUpdate, BucketUpdate),
     Pause,
-    GetSnapshotState,
+    GetQueueStates,
     MarkQueueMemoryDirty,
-    Kick,
+    Kick { resume: bool },
     Reset,
     Finish(FlushMode),
 }
@@ -74,7 +68,7 @@ enum ControlMsg {
 enum ControlResponse {
     DiskUpdated(Result<u64, VirtioBlockError>),
     Paused,
-    SnapshotState(WorkerSnapshotState),
+    QueueStates(Vec<QueueState>),
     QueueMemoryDirty(Result<(), QueueError>),
     Reset(Option<BlockResources>),
 }
@@ -112,7 +106,7 @@ impl ControlResponse {
         match self {
             Self::DiskUpdated(_) => "disk update",
             Self::Paused => "pause",
-            Self::SnapshotState(_) => "snapshot state",
+            Self::QueueStates(_) => "queue states",
             Self::QueueMemoryDirty(_) => "queue memory dirty",
             Self::Reset(_) => "reset",
         }
@@ -129,7 +123,7 @@ impl BlockWorker {
         if let Err(err) = self.resources.queue_evts[0].read() {
             error!("Failed to get queue event: {:?}", err);
             self.metrics.event_fails.inc();
-        } else if self.resources.rate_limiter.is_blocked() {
+        } else if self.rate_limiter_blocked.load(Ordering::Relaxed) {
             self.metrics.rate_limiter_throttled_events.inc();
         } else if self.resources.is_io_engine_throttled {
             self.metrics.io_engine_throttled_events.inc();
@@ -143,15 +137,6 @@ impl BlockWorker {
         self.process_queue(0)
     }
 
-    pub(crate) fn process_rate_limiter_event(&mut self) {
-        self.metrics.rate_limiter_event_count.inc();
-        // Upon rate limiter event, call the rate limiter handler
-        // and restart processing the queue.
-        if self.resources.rate_limiter.event_handler().is_ok() {
-            self.process_queue(0).unwrap()
-        }
-    }
-
     /// Device specific function for peaking inside a queue and processing descriptors.
     fn process_queue(&mut self, queue_index: usize) -> Result<(), InvalidAvailIdx> {
         let queue = &mut self.resources.queues[queue_index];
@@ -162,7 +147,13 @@ impl BlockWorker {
             let processing_result =
                 match Request::parse(&head, &self.active_state.mem, self.resources.disk.nsectors) {
                     Ok(request) => {
-                        if request.rate_limit(&mut self.resources.rate_limiter) {
+                        let is_rate_limited = request.rate_limit(
+                            &mut self
+                                .rate_limiter
+                                .lock()
+                                .expect("Poisoned block rate limiter lock"),
+                        );
+                        if is_rate_limited {
                             // Stop processing the queue and return this descriptor chain to the
                             // avail ring, for later processing.
                             queue.undo_pop();
@@ -332,11 +323,6 @@ impl BlockWorker {
         self.resources.disk.update(disk_image_path, read_only)?;
         Ok(self.resources.disk.nsectors)
     }
-
-    /// Updates the parameters for the rate limiter
-    pub(crate) fn update_rate_limiter(&mut self, bytes: BucketUpdate, ops: BucketUpdate) {
-        self.resources.rate_limiter.update_buckets(bytes, ops);
-    }
 }
 
 impl WorkerHandle {
@@ -469,24 +455,6 @@ impl WorkerHandle {
         }
     }
 
-    /// Forward a rate limiter update to the worker thread.
-    pub(crate) fn update_rate_limiter(&self, bytes: BucketUpdate, ops: BucketUpdate) {
-        if let Err(err) = self
-            .to_worker
-            .send(ControlMsg::UpdateRateLimiter(bytes, ops))
-        {
-            error!("Failed to send block worker rate limiter update: {:?}", err);
-            return;
-        }
-
-        if let Err(err) = self.control_evt.write(1) {
-            error!(
-                "Failed to notify block worker of rate limiter update: {:?}",
-                err
-            );
-        }
-    }
-
     /// Pause data-path processing after completing pending I/O.
     pub(crate) fn pause(&self) {
         if let Err(err) = self.to_worker.send(ControlMsg::Pause) {
@@ -516,27 +484,30 @@ impl WorkerHandle {
         }
     }
 
-    /// Read snapshot state from a paused worker.
-    pub(crate) fn get_snapshot_state(&self) -> WorkerSnapshotState {
-        if let Err(err) = self.to_worker.send(ControlMsg::GetSnapshotState) {
-            error!("Failed to request block worker snapshot state: {:?}", err);
+    /// Read queue state from a paused worker.
+    pub(crate) fn get_queue_states(&self) -> Vec<QueueState> {
+        if let Err(err) = self.to_worker.send(ControlMsg::GetQueueStates) {
+            error!("Failed to request block worker queue states: {:?}", err);
         }
 
         if let Err(err) = self.control_evt.write(1) {
-            error!("Failed to notify block worker of state request: {:?}", err);
+            error!(
+                "Failed to notify block worker of queue state request: {:?}",
+                err
+            );
         }
 
         loop {
             match self.from_worker.recv() {
-                Ok(ControlResponse::SnapshotState(state)) => return state,
+                Ok(ControlResponse::QueueStates(states)) => return states,
                 Ok(response) => {
                     warn!(
-                        "Ignoring {} response while waiting for snapshot state",
+                        "Ignoring {} response while waiting for queue states",
                         response.name()
                     );
                 }
                 Err(err) => {
-                    error!("Block worker failed to return snapshot state: {:?}", err);
+                    error!("Block worker failed to return queue states: {:?}", err);
                 }
             }
         }
@@ -578,8 +549,8 @@ impl WorkerHandle {
     }
 
     /// Resume a paused worker and process pending queue entries.
-    pub(crate) fn kick(&self) {
-        if let Err(err) = self.to_worker.send(ControlMsg::Kick) {
+    pub(crate) fn kick(&self, resume: bool) {
+        if let Err(err) = self.to_worker.send(ControlMsg::Kick { resume }) {
             error!("Failed to send block worker kick: {:?}", err);
             return;
         }
@@ -607,9 +578,8 @@ impl WorkerHandle {
 
 impl ThreadedWorker {
     const PROCESS_QUEUE: u32 = 0;
-    const PROCESS_RATE_LIMITER: u32 = 1;
-    const PROCESS_ASYNC_COMPLETION: u32 = 2;
-    const PROCESS_CONTROL: u32 = 3;
+    const PROCESS_ASYNC_COMPLETION: u32 = 1;
+    const PROCESS_CONTROL: u32 = 2;
 
     fn register_control_event(&self, ops: &mut EventOps) {
         if let Err(err) = ops.add(Events::with_data(
@@ -629,13 +599,6 @@ impl ThreadedWorker {
         )) {
             error!("Failed to register queue event: {}", err);
         }
-        if let Err(err) = ops.add(Events::with_data(
-            &resources.rate_limiter,
-            Self::PROCESS_RATE_LIMITER,
-            EventSet::IN,
-        )) {
-            error!("Failed to register rate limiter event: {}", err);
-        }
         if let FileEngine::Async(ref engine) = resources.disk.file_engine
             && let Err(err) = ops.add(Events::with_data(
                 engine.completion_evt(),
@@ -654,13 +617,6 @@ impl ThreadedWorker {
             EventSet::IN,
         )) {
             error!("Failed to unregister queue event: {}", err);
-        }
-        if let Err(err) = ops.remove(Events::with_data(
-            &resources.rate_limiter,
-            Self::PROCESS_RATE_LIMITER,
-            EventSet::IN,
-        )) {
-            error!("Failed to unregister rate limiter event: {}", err);
         }
         if let FileEngine::Async(ref engine) = resources.disk.file_engine
             && let Err(err) = ops.remove(Events::with_data(
@@ -688,11 +644,10 @@ impl ThreadedWorker {
                 ControlMsg::UpdateDiskImage(path, read_only) => {
                     self.update_disk_image(path, read_only)
                 }
-                ControlMsg::UpdateRateLimiter(bytes, ops) => self.update_rate_limiter(bytes, ops),
                 ControlMsg::Pause => self.pause_worker(ops),
-                ControlMsg::GetSnapshotState => self.send_snapshot_state(),
+                ControlMsg::GetQueueStates => self.send_queue_states(),
                 ControlMsg::MarkQueueMemoryDirty => self.mark_queue_memory_dirty(),
-                ControlMsg::Kick => self.kick_worker(ops),
+                ControlMsg::Kick { resume } => self.kick_worker(resume, ops),
                 ControlMsg::Reset => self.reset_worker(ops),
                 ControlMsg::Finish(flush_mode) => self.finish_worker(flush_mode, ops),
             }
@@ -740,20 +695,6 @@ impl ThreadedWorker {
         }
     }
 
-    fn update_rate_limiter(&mut self, bytes: BucketUpdate, ops: BucketUpdate) {
-        match &mut self.state {
-            WorkerState::Running(worker) | WorkerState::Paused(worker) => {
-                worker.update_rate_limiter(bytes, ops)
-            }
-            WorkerState::Parked => {
-                warn!("Rate limiter update requested while block worker is parked");
-            }
-            WorkerState::Finished => {
-                warn!("Rate limiter update requested after block worker finished");
-            }
-        }
-    }
-
     fn pause_worker(&mut self, ops: &mut EventOps) {
         match std::mem::replace(&mut self.state, WorkerState::Parked) {
             WorkerState::Running(mut worker) => {
@@ -776,19 +717,16 @@ impl ThreadedWorker {
         }
     }
 
-    fn send_snapshot_state(&self) {
+    fn send_queue_states(&self) {
         let WorkerState::Paused(worker) = &self.state else {
-            warn!("Snapshot state requested while block worker is not paused");
+            warn!("Queue states requested while block worker is not paused");
             return;
         };
 
-        let state = WorkerSnapshotState {
-            queue_states: worker.resources.queues.iter().map(Persist::save).collect(),
-            rate_limiter_state: worker.resources.rate_limiter.save(),
-        };
+        let states = worker.resources.queues.iter().map(Persist::save).collect();
 
-        if let Err(err) = self.to_vmm.send(ControlResponse::SnapshotState(state)) {
-            error!("Failed to send block worker snapshot state: {:?}", err);
+        if let Err(err) = self.to_vmm.send(ControlResponse::QueueStates(states)) {
+            error!("Failed to send block worker queue states: {:?}", err);
         }
     }
 
@@ -816,11 +754,15 @@ impl ThreadedWorker {
         }
     }
 
-    fn kick_worker(&mut self, ops: &mut EventOps) {
+    fn kick_worker(&mut self, resume: bool, ops: &mut EventOps) {
         match std::mem::replace(&mut self.state, WorkerState::Parked) {
-            WorkerState::Paused(worker) => {
+            WorkerState::Paused(worker) if resume => {
                 Self::register_runtime_events(&worker.resources, ops);
                 self.state = WorkerState::Running(worker);
+            }
+            WorkerState::Paused(worker) => {
+                self.state = WorkerState::Paused(worker);
+                return;
             }
             WorkerState::Running(worker) => {
                 self.state = WorkerState::Running(worker);
@@ -944,7 +886,6 @@ impl MutEventSubscriber for ThreadedWorker {
         if let WorkerState::Running(worker) = &mut self.state {
             match source {
                 Self::PROCESS_QUEUE => worker.process_queue_event(),
-                Self::PROCESS_RATE_LIMITER => worker.process_rate_limiter_event(),
                 Self::PROCESS_ASYNC_COMPLETION => worker.process_async_completion_event(),
                 Self::PROCESS_CONTROL => self.process_control_event(ops),
                 _ => warn!("Block: Spurious event received: {:?}", source),

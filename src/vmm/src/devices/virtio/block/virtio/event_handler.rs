@@ -22,13 +22,6 @@ impl VirtioBlock {
         )) {
             error!("Failed to register queue event: {}", err);
         }
-        if let Err(err) = ops.add(Events::with_data(
-            &self.resources().rate_limiter,
-            Self::PROCESS_RATE_LIMITER,
-            EventSet::IN,
-        )) {
-            error!("Failed to register ratelimiter event: {}", err);
-        }
         if let FileEngine::Async(ref engine) = self.resources().disk.file_engine
             && let Err(err) = ops.add(Events::with_data(
                 engine.completion_evt(),
@@ -37,6 +30,16 @@ impl VirtioBlock {
             ))
         {
             error!("Failed to register IO engine completion event: {}", err);
+        }
+    }
+
+    fn register_rate_limiter_event(&self, ops: &mut EventOps) {
+        if let Err(err) = ops.add(Events::with_data(
+            &*self.rate_limiter(),
+            Self::PROCESS_RATE_LIMITER,
+            EventSet::IN,
+        )) {
+            error!("Failed to register rate limiter event: {}", err);
         }
     }
 
@@ -54,6 +57,7 @@ impl VirtioBlock {
         if let Err(err) = self.activate_evt.read() {
             error!("Failed to consume block activate event: {:?}", err);
         }
+        self.register_rate_limiter_event(ops);
         if !self.is_threaded_active() {
             self.register_runtime_events(ops);
         }
@@ -100,7 +104,7 @@ impl MutEventSubscriber for VirtioBlock {
             match source {
                 Self::PROCESS_QUEUE => self.drain_queue_events(),
                 Self::PROCESS_RATE_LIMITER => {
-                    self.resources_mut().rate_limiter.event_handler();
+                    self.rate_limiter().event_handler();
                 }
                 Self::PROCESS_ASYNC_COMPLETION => {
                     if let FileEngine::Async(ref engine) = self.resources().disk.file_engine {
@@ -118,6 +122,7 @@ impl MutEventSubscriber for VirtioBlock {
         //  - on device activation (is-activated already true at this point),
         //  - on device restore from snapshot.
         if self.is_activated() {
+            self.register_rate_limiter_event(ops);
             if !self.is_threaded_active() {
                 self.register_runtime_events(ops);
             }
@@ -130,17 +135,22 @@ impl MutEventSubscriber for VirtioBlock {
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, Mutex};
+    use std::thread;
+    use std::time::{Duration, Instant};
 
     use event_manager::{EventManager, SubscriberOps};
 
     use super::*;
     use crate::devices::virtio::block::virtio::device::FileEngineType;
+    use crate::devices::virtio::block::virtio::metrics::BlockDeviceMetrics;
     use crate::devices::virtio::block::virtio::test_utils::{
-        default_block, read_blk_req_descriptors, set_queue, simulate_async_completion_event,
+        default_block, default_threaded_block, read_blk_req_descriptors, set_queue,
+        set_rate_limiter, simulate_async_completion_event,
     };
     use crate::devices::virtio::block::virtio::{VIRTIO_BLK_S_OK, VIRTIO_BLK_T_OUT};
     use crate::devices::virtio::queue::VIRTQ_DESC_F_NEXT;
     use crate::devices::virtio::test_utils::{VirtQueue, default_interrupt, default_mem};
+    use crate::rate_limiter::{RateLimiter, TokenType};
     use crate::vstate::memory::{Bytes, GuestAddress};
 
     #[test]
@@ -200,6 +210,75 @@ mod tests {
             .expect("Metrics event timeout or error.");
         // Complete async IO ops if needed
         simulate_async_completion_event(&mut block.lock().unwrap(), true);
+
+        assert_eq!(vq.used.idx.get(), 1);
+        assert_eq!(vq.used.ring[0].get().id, 0);
+        assert_eq!(vq.used.ring[0].get().len, 1);
+        assert_eq!(mem.read_obj::<u32>(status_addr).unwrap(), VIRTIO_BLK_S_OK);
+    }
+
+    #[test]
+    fn test_threaded_rate_limiter_event() {
+        let mut event_manager = EventManager::new().unwrap();
+        let mut block = default_threaded_block(FileEngineType::Sync);
+        block.metrics = Arc::new(BlockDeviceMetrics::default());
+        let mem = default_mem();
+        let vq = VirtQueue::new(GuestAddress(0), &mem, 16);
+        set_queue(&mut block, 0, vq.create_queue());
+        read_blk_req_descriptors(&vq);
+
+        let request_type_addr = GuestAddress(vq.dtable[0].addr.get());
+        let data_addr = GuestAddress(vq.dtable[1].addr.get());
+        let status_addr = GuestAddress(vq.dtable[2].addr.get());
+        mem.write_obj::<u32>(VIRTIO_BLK_T_OUT, request_type_addr)
+            .unwrap();
+        vq.dtable[1].flags.set(VIRTQ_DESC_F_NEXT);
+        vq.dtable[1].len.set(512);
+        mem.write_obj::<u64>(123_456_789, data_addr).unwrap();
+
+        let mut rate_limiter = RateLimiter::new(0, 0, 0, 1, 0, 100);
+        assert!(rate_limiter.consume(1, TokenType::Ops));
+        set_rate_limiter(&mut block, rate_limiter);
+
+        let block = Arc::new(Mutex::new(block));
+        let _id = event_manager.add_subscriber(block.clone());
+        block
+            .lock()
+            .unwrap()
+            .activate(mem.clone(), default_interrupt())
+            .unwrap();
+        assert_eq!(event_manager.run_with_timeout(50).unwrap(), 1);
+
+        block
+            .lock()
+            .unwrap()
+            .queue_event(0)
+            .unwrap()
+            .write(1)
+            .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            if block.lock().unwrap().rate_limiter().is_blocked() {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "worker did not consume the queue"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(vq.used.idx.get(), 0);
+
+        block.lock().unwrap().prepare_save();
+        assert_eq!(event_manager.run_with_timeout(500).unwrap(), 1);
+        VirtioDevice::mark_queue_memory_dirty(&mut *block.lock().unwrap(), &mem).unwrap();
+
+        assert!(!block.lock().unwrap().rate_limiter().is_blocked());
+        assert_eq!(vq.used.idx.get(), 0);
+
+        VirtioDevice::kick(&mut *block.lock().unwrap());
+        block.lock().unwrap().prepare_save();
 
         assert_eq!(vq.used.idx.get(), 1);
         assert_eq!(vq.used.ring[0].get().id, 0);
