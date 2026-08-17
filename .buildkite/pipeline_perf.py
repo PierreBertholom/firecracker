@@ -41,6 +41,21 @@ perf_test = {
         ),
         "devtool_opts": "-c 1-16 -m 0",
     },
+    "device-io-block-net-30vcpu-mq": {
+        "label": "device-io-block-net-30vcpu-mq",
+        # 1q inline vs 30q threaded (one worker per vCPU) comparison only, at
+        # 30 vCPUs. Needs its own cpuset: pin_threads() dedicates a core per
+        # vCPU/VMM/API/block-worker, and the "concurrent" scenario pins one
+        # more iperf3 server per vCPU on top of that (up to 30+1+1+30+30=92
+        # cores for the threaded-multiqueue case) - see BLOCK_VCPU_MODES in
+        # test_device_io_interference.py for the full budget breakdown.
+        "tests": (
+            "integration_tests/performance/test_device_io_interference.py::"
+            "test_block_net_throughput_interference "
+            "-k 'PCI_ON and (30vcpu-inline-1q or 30vcpu-threaded-multiqueue)'"
+        ),
+        "devtool_opts": "-c 1-95 -m 0",
+    },
     "device-io-network-latency": {
         "label": "device-io-network-latency",
         "tests": "integration_tests/performance/test_device_io_interference.py::test_network_latency_under_block_load",

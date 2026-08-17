@@ -45,9 +45,16 @@ BLOCK_MODES = [
 
 # (vcpus, threaded, multiqueue) combos for test_block_net_throughput_interference.
 # Covers the full inline/threaded/multiqueue matrix at 2 and 4 vCPUs, plus a
-# 32-vCPU scaling comparison of inline-1q vs threaded-multiqueue only (a
-# threaded-1q case at 32 vCPUs would just be a single-queue bottleneck with no
+# 30-vCPU scaling comparison of inline-1q vs threaded-multiqueue only (a
+# threaded-1q case at 30 vCPUs would just be a single-queue bottleneck with no
 # extra signal beyond the 2/4-vCPU threaded-1q cases already covered above).
+#
+# 30, not 32: the "concurrent" scenario additionally pins one iperf3 server
+# per vCPU on top of vm.pin_threads()'s dedicated core per vCPU/VMM/API/block
+# worker (IPerf3Test.run_test, utils_iperf.py). At 32 vCPUs + threaded
+# multiqueue that's 32+1+1+32 vm.pin_threads cores + 32 iperf cores = 98,
+# which doesn't fit a 96-core single-NUMA-node host (e.g. m7i.metal-24xl). 30
+# vCPUs needs at most 30+1+1+30+30 = 92, leaving headroom on such a host.
 BLOCK_VCPU_MODES = [
     pytest.param(vcpus, threaded, multiqueue, id=f"{vcpus}vcpu-{mode_id}")
     for vcpus in (2, 4)
@@ -57,8 +64,8 @@ BLOCK_VCPU_MODES = [
         (True, True, "threaded-multiqueue"),
     ]
 ] + [
-    pytest.param(32, False, False, id="32vcpu-inline-1q"),
-    pytest.param(32, True, True, id="32vcpu-threaded-multiqueue"),
+    pytest.param(30, False, False, id="30vcpu-inline-1q"),
+    pytest.param(30, True, True, id="30vcpu-threaded-multiqueue"),
 ]
 
 
