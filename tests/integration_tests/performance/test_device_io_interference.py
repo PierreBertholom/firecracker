@@ -43,6 +43,24 @@ BLOCK_MODES = [
     pytest.param(True, True, id="threaded-multiqueue"),
 ]
 
+# (vcpus, threaded, multiqueue) combos for test_block_net_throughput_interference.
+# Covers the full inline/threaded/multiqueue matrix at 2 and 4 vCPUs, plus a
+# 32-vCPU scaling comparison of inline-1q vs threaded-multiqueue only (a
+# threaded-1q case at 32 vCPUs would just be a single-queue bottleneck with no
+# extra signal beyond the 2/4-vCPU threaded-1q cases already covered above).
+BLOCK_VCPU_MODES = [
+    pytest.param(vcpus, threaded, multiqueue, id=f"{vcpus}vcpu-{mode_id}")
+    for vcpus in (2, 4)
+    for threaded, multiqueue, mode_id in [
+        (False, False, "inline-1q"),
+        (True, False, "threaded-1q"),
+        (True, True, "threaded-multiqueue"),
+    ]
+] + [
+    pytest.param(32, False, False, id="32vcpu-inline-1q"),
+    pytest.param(32, True, True, id="32vcpu-threaded-multiqueue"),
+]
+
 
 def block_num_queues(vcpus, multiqueue):
     """Use one block queue per vCPU for multiqueue benchmark cases."""
@@ -191,8 +209,7 @@ def consume_ping_output(ping_output):
 
 @pytest.mark.nonci
 @pytest.mark.timeout(300)
-@pytest.mark.parametrize("vcpus", [2, 4], ids=["2vcpu", "4vcpu"])
-@pytest.mark.parametrize("threaded,multiqueue", BLOCK_MODES)
+@pytest.mark.parametrize("vcpus,threaded,multiqueue", BLOCK_VCPU_MODES)
 @pytest.mark.parametrize("scenario", ["block_only", "concurrent"])
 def test_block_net_throughput_interference(
     uvm,
