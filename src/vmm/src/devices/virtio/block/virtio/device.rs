@@ -158,14 +158,28 @@ impl DiskProperties {
     }
 }
 
-#[derive(Debug, Default, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
 #[repr(C)]
 pub struct ConfigSpace {
     pub capacity: u64,
+    pub _reserved: [u8; 26],
+    pub num_queues: u16,
+    pub _max_discard_sectors: u32,
 }
 
 // SAFETY: `ConfigSpace` contains only PODs in `repr(C)` or `repr(transparent)`, without padding.
 unsafe impl ByteValued for ConfigSpace {}
+
+impl Default for ConfigSpace {
+    fn default() -> Self {
+        Self {
+            capacity: 0,
+            _reserved: [0u8; 26],
+            num_queues: 1u16.to_le(),
+            _max_discard_sectors: 0,
+        }
+    }
+}
 
 /// Use this structure to set up the Block Device before booting the kernel.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -336,6 +350,7 @@ impl VirtioBlock {
 
         let config_space = ConfigSpace {
             capacity: disk_properties.nsectors.to_le(),
+            ..Default::default()
         };
         let metrics = BlockMetricsPerDevice::alloc(config.drive_id.clone());
 
@@ -542,7 +557,7 @@ impl VirtioDevice for VirtioBlock {
     }
 
     fn num_queues(&self) -> usize {
-        1
+        usize::from(self.config_space.num_queues)
     }
 
     fn queue_config(&self, index: usize) -> Option<&QueueConfig> {
@@ -908,7 +923,10 @@ mod tests {
 
             let config = block.config_as_bytes();
             // The block's backing file size is 0x1000, so there are 8 (4096/512) sectors.
-            let expected_config_space = ConfigSpace { capacity: 8 };
+            let expected_config_space = ConfigSpace {
+                capacity: 8,
+                ..Default::default()
+            };
             assert_eq!(config, expected_config_space.as_slice());
         }
     }
@@ -938,6 +956,7 @@ mod tests {
                 0,
                 ConfigSpace {
                     capacity: 0x1122334455667788,
+                    ..Default::default()
                 }
                 .as_slice(),
             );

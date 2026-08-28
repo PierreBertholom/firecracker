@@ -144,6 +144,7 @@ impl Persist<'_> for VirtioBlock {
 
         let config_space = ConfigSpace {
             capacity: disk_properties.nsectors.to_le(),
+            ..Default::default()
         };
         let resources = BlockResources {
             queue,
