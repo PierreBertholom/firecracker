@@ -24,7 +24,7 @@ pub const SECTOR_SHIFT: u8 = 9;
 /// Size of block sector.
 pub const SECTOR_SIZE: u32 = (0x01_u32) << SECTOR_SHIFT;
 /// The number of queues of block device.
-pub const DEFAULT_BLOCK_NUM_QUEUES: usize = 1;
+pub const DEFAULT_BLOCK_NUM_QUEUES: u16 = 1;
 
 pub const BLOCK_QUEUE_SIZE: u16 = FIRECRACKER_MAX_QUEUE_SIZE;
 // The virtio queue can hold up to 256 descriptors, but 1 request spreads across 2-3 descriptors.
@@ -69,4 +69,8 @@ pub enum VirtioBlockError {
     ThreadSpawn(std::io::Error),
     /// Error communicating with the block worker thread: {0}
     WorkerControl(String),
+    /// Invalid queue count {0}; expected a value between 1 and {1}.
+    InvalidQueueCount(u16, u16),
+    /// Block multiqueue requires threaded mode.
+    MultiqueueRequiresThreaded,
 }
