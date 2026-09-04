@@ -914,6 +914,7 @@ class Microvm:
         cache_type=None,
         io_engine=None,
         threaded=None,
+        num_queues=None,
     ):
         """Add a block device."""
 
@@ -927,6 +928,7 @@ class Microvm:
             cache_type=cache_type,
             io_engine=io_engine,
             threaded=threaded,
+            num_queues=num_queues,
         )
         self.disks[drive_id] = path_on_host
 
