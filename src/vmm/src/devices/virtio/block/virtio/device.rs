@@ -452,6 +452,10 @@ impl VirtioBlock {
             return Err(VirtioBlockError::DiscardAsyncUnsupported);
         }
 
+        if config.num_queues > 1 && !config.threaded {
+            return Err(VirtioBlockError::MultiqueueRequiresThreaded);
+        }
+
         let disk_properties = DiskProperties::new(
             &config.path_on_host,
             config.is_read_only,

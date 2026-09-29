@@ -803,6 +803,7 @@ pub(crate) mod tests {
     use crate::rpc_interface::VmmActionError;
     use crate::vmm_config::HotplugDeviceConfig;
     use crate::vmm_config::drive::{BlockDeviceConfig, DriveError};
+    use crate::vmm_config::machine_config::MachineConfigError;
     use crate::vmm_config::net::{NetworkInterfaceConfig, NetworkInterfaceError};
     use crate::vmm_config::pmem::{PmemConfig, PmemConfigError};
     use crate::vstate::resources::ResourceAllocator;
@@ -942,6 +943,17 @@ pub(crate) mod tests {
         let mut evt_manager = EventManager::new().unwrap();
         let mut vmm = default_vmm_with_pci();
         let f = TempFile::new().unwrap();
+
+        // Queue count cannot exceed the vCPU count.
+        let mut invalid_cfg = make_hotplug_block_cfg("invalid", &f, false);
+        invalid_cfg.threaded = true;
+        invalid_cfg.num_queues = 2;
+        assert!(matches!(
+            vmm.hotplug_device(HotplugDeviceConfig::Block(invalid_cfg), &mut evt_manager),
+            Err(VmmActionError::MachineConfig(
+                MachineConfigError::InvalidQueueCount(2, 1)
+            ))
+        ));
 
         // Successful case
         let cfg = HotplugDeviceConfig::Block(make_hotplug_block_cfg("block0", &f, false));

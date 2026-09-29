@@ -76,4 +76,6 @@ pub enum VirtioBlockError {
     Persist(crate::devices::virtio::persist::PersistError),
     /// Error spawning the block worker thread: {0}
     ThreadSpawn(std::io::Error),
+    /// Block multiqueue requires threaded mode.
+    MultiqueueRequiresThreaded,
 }

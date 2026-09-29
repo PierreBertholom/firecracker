@@ -24,6 +24,8 @@ pub enum MachineConfigError {
     InvalidVcpuCount,
     /// Could not get the configuration of the previously installed balloon device to validate the memory size.
     InvalidVmState,
+    /// Invalid queue count {0}; must be between 1 and the configured vCPU count {1}.
+    InvalidQueueCount(u16, u8),
     /// Enabling simultaneous multithreading is not supported on aarch64.
     #[cfg(target_arch = "aarch64")]
     SmtNotSupported,
@@ -298,12 +300,22 @@ impl MachineConfig {
             gdb_socket_path: update.gdb_socket_path.clone(),
         })
     }
+
+    pub(crate) fn validate_num_queues(&self, num_queues: u16) -> Result<(), MachineConfigError> {
+        if num_queues == 0 || num_queues > u16::from(self.vcpu_count) {
+            return Err(MachineConfigError::InvalidQueueCount(
+                num_queues,
+                self.vcpu_count,
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use crate::cpu_config::templates::{CpuTemplateType, CustomCpuTemplate, StaticCpuTemplate};
-    use crate::vmm_config::machine_config::MachineConfig;
+    use crate::vmm_config::machine_config::{MachineConfig, MachineConfigError};
 
     // Ensure the special (de)serialization logic for the cpu_template field works:
     // only static cpu templates can be specified via the machine-config endpoint, but
@@ -349,5 +361,24 @@ mod tests {
         let deserialized = serde_json::from_str::<MachineConfig>(&serialized).unwrap();
 
         assert!(deserialized.cpu_template.is_none());
+    }
+
+    #[test]
+    fn test_validate_num_queues() {
+        let mconfig = MachineConfig {
+            vcpu_count: 4,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            mconfig.validate_num_queues(0),
+            Err(MachineConfigError::InvalidQueueCount(0, 4))
+        );
+        mconfig.validate_num_queues(1).unwrap();
+        mconfig.validate_num_queues(4).unwrap();
+        assert_eq!(
+            mconfig.validate_num_queues(5),
+            Err(MachineConfigError::InvalidQueueCount(5, 4))
+        );
     }
 }
