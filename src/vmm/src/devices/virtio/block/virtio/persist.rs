@@ -124,6 +124,7 @@ impl Persist<'_> for VirtioBlock {
             is_read_only,
             discard: state.virtio_state.avail_features & (1u64 << VIRTIO_BLK_F_DISCARD) != 0,
             threaded: state.threaded,
+            num_queues: DEFAULT_BLOCK_NUM_QUEUES,
             path_on_host: state.disk_path.clone(),
             rate_limiter: rate_limiter_config.into_option(),
             file_engine_type: state.file_engine_type.into(),
@@ -144,7 +145,7 @@ impl Persist<'_> for VirtioBlock {
             .build_queues_checked(
                 &constructor_args.mem,
                 VirtioDeviceType::Block,
-                DEFAULT_BLOCK_NUM_QUEUES,
+                usize::from(DEFAULT_BLOCK_NUM_QUEUES),
                 FIRECRACKER_MAX_QUEUE_SIZE,
             )
             .map_err(VirtioBlockError::Persist)?
@@ -209,6 +210,7 @@ mod tests {
             is_read_only: false,
             discard: false,
             threaded: false,
+            num_queues: 1,
             cache_type: CacheType::Writeback,
             rate_limiter: None,
             file_engine_type: FileEngineType::default(),
@@ -254,6 +256,7 @@ mod tests {
             is_read_only: false,
             discard: false,
             threaded: false,
+            num_queues: 1,
             cache_type: CacheType::Unsafe,
             rate_limiter: None,
             file_engine_type: FileEngineType::default(),

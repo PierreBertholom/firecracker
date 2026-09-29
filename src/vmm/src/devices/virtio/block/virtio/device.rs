@@ -314,6 +314,8 @@ pub struct VirtioBlockConfig {
     pub discard: bool,
     /// If set to true, process requests on a dedicated worker thread.
     pub threaded: bool,
+    /// Number of queues of the device. Cannot exceed the configured vCPU count.
+    pub num_queues: u16,
     /// Path of the backing file on the host
     pub path_on_host: String,
     /// Rate Limiter for I/O operations.
@@ -342,6 +344,7 @@ impl TryFrom<&BlockDeviceConfig> for VirtioBlockConfig {
                 is_read_only: value.is_read_only.unwrap_or(false),
                 discard: value.discard.unwrap_or(false),
                 threaded: value.threaded,
+                num_queues: value.num_queues,
                 path_on_host: path_on_host.clone(),
                 rate_limiter: value.rate_limiter,
                 file_engine_type: value.file_engine_type.unwrap_or_default(),
@@ -365,6 +368,7 @@ impl From<VirtioBlockConfig> for BlockDeviceConfig {
             is_read_only: Some(value.is_read_only),
             discard: Some(value.discard),
             threaded: value.threaded,
+            num_queues: value.num_queues,
             path_on_host: Some(value.path_on_host),
             rate_limiter: value.rate_limiter,
             file_engine_type: Some(value.file_engine_type),
@@ -1093,6 +1097,7 @@ mod tests {
             is_read_only: Some(true),
             discard: None,
             threaded: false,
+            num_queues: 1,
             path_on_host: Some("path".to_string()),
             rate_limiter: None,
             file_engine_type: Default::default(),
@@ -1112,6 +1117,7 @@ mod tests {
             is_read_only: None,
             discard: None,
             threaded: false,
+            num_queues: 1,
             path_on_host: None,
             rate_limiter: None,
             file_engine_type: Default::default(),
@@ -1131,6 +1137,7 @@ mod tests {
             is_read_only: Some(true),
             discard: None,
             threaded: false,
+            num_queues: 1,
             path_on_host: Some("path".to_string()),
             rate_limiter: None,
             file_engine_type: Default::default(),
@@ -1209,6 +1216,7 @@ mod tests {
             is_read_only: false,
             discard: true,
             threaded: false,
+            num_queues: 1,
             cache_type: CacheType::Unsafe,
             rate_limiter: None,
             file_engine_type: FileEngineType::Sync,
@@ -1238,6 +1246,7 @@ mod tests {
             is_read_only: false,
             discard: true,
             threaded: false,
+            num_queues: 1,
             cache_type: CacheType::Unsafe,
             rate_limiter: None,
             file_engine_type: FileEngineType::Async,
@@ -1259,6 +1268,7 @@ mod tests {
             is_read_only: true,
             discard: true,
             threaded: false,
+            num_queues: 1,
             cache_type: CacheType::Unsafe,
             rate_limiter: None,
             file_engine_type: FileEngineType::Sync,
@@ -1283,6 +1293,7 @@ mod tests {
             is_read_only: false,
             discard: true,
             threaded: false,
+            num_queues: 1,
             cache_type: CacheType::Unsafe,
             rate_limiter: None,
             file_engine_type: FileEngineType::Sync,
@@ -2365,7 +2376,7 @@ mod tests {
         block.activate(mem.clone(), interrupt).unwrap();
 
         assert!(block.is_threaded_active());
-        assert_eq!(block.num_queues(), DEFAULT_BLOCK_NUM_QUEUES);
+        assert_eq!(block.num_queues(), usize::from(DEFAULT_BLOCK_NUM_QUEUES));
         assert_eq!(block.queue_config(0).unwrap().size, vq.size());
         assert!(block.queue_config_mut(0).is_some());
         assert!(block.queue_event(0).is_some());

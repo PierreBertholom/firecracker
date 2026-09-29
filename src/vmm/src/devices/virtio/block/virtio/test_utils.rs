@@ -55,6 +55,7 @@ pub fn default_block_with_path(path: String, file_engine_type: FileEngineType) -
         is_read_only: false,
         discard: false,
         threaded: false,
+        num_queues: 1,
         cache_type: CacheType::Unsafe,
         // Rate limiting is enabled but with a high operation rate (10 million ops/s).
         rate_limiter: Some(RateLimiterConfig {
